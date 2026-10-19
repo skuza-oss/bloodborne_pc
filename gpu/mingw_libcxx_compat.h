@@ -3,6 +3,12 @@
 // code (FidelityFX SDK, sirit, shadPS4) relied on that for std::abort, _countof, swprintf_s,
 // placement new and the math functions.
 #pragma once
+// Before any C runtime header, as in platform/win32/include/bbport_win32.h (force-included
+// after this one): a 64-bit off_t in every file, or mmap()'s offset differs between the C
+// callers and posix_memory.cpp and offsets past 2 GiB come out sign-extended.
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <wchar.h>

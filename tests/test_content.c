@@ -45,7 +45,7 @@ int main(int argc,char **argv) {
     Param param=GET(Param,"99b82IKXpH4#c#d");
     List list=GET(List,"xnd8BJzAxmk#c#d");
     assert(load && loaded && unload && init && param && list);
-    assert(!runtime_content_resolve("g8cM39EUZ6o#I#J"));
+    assert(runtime_content_resolve("g8cM39EUZ6o#I#J")); /* any library letters (runtime_nid_is) */
     if (argc>1 && !strcmp(argv[1],"--missing")) { load(0xb4); return 99; }
     const uint32_t profile[]={1,13,0x80000000,0,7};
     runtime_content_configure(profile);
@@ -106,6 +106,6 @@ int main(int argc,char **argv) {
     assert((uint32_t)init(initial,b.boot)==0x80d90003);
     assert(unload(0xb4)==0 && (uint32_t)loaded(0xb4)==0x805a1001);
     assert(load(0xb4)==0 && init(initial,b.boot)==0 && unload(0xb4)==0);
-    puts("PASS: AppContent lifecycle, profile and output boundaries");
+    puts("PASS: AppContent lifecycle, profile, add-on folders and output boundaries");
     return 0;
 }

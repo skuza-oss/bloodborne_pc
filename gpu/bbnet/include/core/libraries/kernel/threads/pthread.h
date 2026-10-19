@@ -59,6 +59,5 @@ int scePthreadAttrSetaffinity(PthreadAttrT* attr, u64 mask);
 int posix_pthread_create_name_np(PthreadT* thread, const PthreadAttrT* attr,
                                  PthreadEntryFunc start, void* arg, const char* name);
 int posix_pthread_join(PthreadT thread, void** ret);
-[[noreturn]] void posix_pthread_exit(void* status);
 
 } // namespace Libraries::Kernel

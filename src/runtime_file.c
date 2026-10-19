@@ -8,30 +8,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
-#ifdef _WIN32
-#include <windows.h>
-/* 64-bit sizes and times; directories are never opened as CRT descriptors. */
-typedef struct _stat64 HostStat;
-#define host_stat(path,s) _stat64(path,s)
-#define host_fstat(fd,s) _fstat64(fd,s)
-#define host_lseek _lseeki64
-#define O_DIRECTORY 0x40000000 /* bbport marker, removed before _open */
-#else
-typedef struct stat HostStat;
-#define host_stat(path,s) stat(path,s)
-#define host_fstat(fd,s) fstat(fd,s)
-#define host_lseek lseek
-#endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define MAX_FILES 1024
-#define MAX_MOUNTS 16
+#define MAX_MOUNTS 64 /* app0, 16 save data slots, 16 add-ons and the rest */
 
 typedef struct { int64_t sec, nsec; } GuestTimespec;
 typedef struct {
@@ -48,8 +36,7 @@ _Static_assert(sizeof(GuestStat)==120,"FreeBSD stat layout");
 
 typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Listing;
 /* commit: a save file opened for writing is written to a temporary copy (temp), which replaces
- * the file (commit) in one rename when closed: a crash or a kill mid-save leaves the old file
- * (from bbport 0.5, deadinside28#64). */
+ * the file (commit) in one rename when closed: a crash or a kill mid-save leaves the old file. */
 typedef struct { int used, host, dirty; Listing *dir; size_t position; char path[512]; char *commit, *temp; } File;
 typedef struct { char guest[64]; char host[512]; } Mount;
 static File files[MAX_FILES];
@@ -63,8 +50,7 @@ static int temp_name(const char *name) {
     size_t n=strlen(name);
     return n>6 && !strcmp(name+n-6,".bbtmp");
 }
-/* Copies left by a crash (none of them open): removed when their directory is mounted. Called
- * with the lock held. */
+/* Copies left by a crash (none of them open): removed when their directory is mounted. */
 static void remove_stale_temps(const char *dir,int depth) {
     DIR *d=opendir(dir);
     if (!d) return;
@@ -76,10 +62,7 @@ static void remove_stale_temps(const char *dir,int depth) {
             int open_now=0;
             for (int i=3;i<MAX_FILES;++i) if (files[i].used && files[i].temp && !strcmp(files[i].temp,path)) open_now=1;
             if (!open_now && !unlink(path)) printf("Runtime: removed %s (a save interrupted earlier; the file it would have replaced is intact)\n",path);
-        } else if (depth<4) {
-            struct stat st;
-            if (!stat(path,&st) && S_ISDIR(st.st_mode)) remove_stale_temps(path,depth+1);
-        }
+        } else if (depth<4 && e->d_type==DT_DIR) remove_stale_temps(path,depth+1);
     }
     closedir(d);
 }
@@ -151,8 +134,8 @@ static int translate(const char *guest,char *out,size_t size) {
                 char original[5];
                 memcpy(original,folder,5);
                 memcpy(folder,"porbr",5);
-                HostStat file;
-                if (host_stat(out,&file)) memcpy(folder,original,5);
+                struct stat file;
+                if (stat(out,&file)) memcpy(folder,original,5);
                 break;
             }
         }
@@ -172,14 +155,50 @@ static int translate(const char *guest,char *out,size_t size) {
                     char original[3];
                     memcpy(original,suffix+1,3);
                     memcpy(suffix+1,voice,3);
-                    HostStat file;
-                    if (host_stat(out,&file)) memcpy(suffix+1,original,3);
+                    struct stat file;
+                    if (stat(out,&file)) memcpy(suffix+1,original,3);
                 }
             }
         }
     }
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
+    /* BB_FILE_TRACE=1: every guest path the game opens, stats or checks (mods, missing files). */
+    static int trace=-1;
+    if (trace<0) { const char *t=getenv("BB_FILE_TRACE"); trace=t && t[0]=='1'; }
+    if (trace) printf("File trace: %s -> %s\n",guest,result ? "(no mount)" : out);
     return result;
+}
+/* The PS4's file system ignores case, and the game asks for lower-case names
+ * (adhoc/font/dbgfont14h.ccm): files from mods or dumps made elsewhere keep their own case.
+ * After a miss, the host path is matched component by component ignoring case; true when it was
+ * corrected (same length: only case differs). Only on misses: no cost for found files. */
+static int fix_case(char *path) {
+    if (path[0]!='/') return 0;
+    char out[1024]="", trial[1024], part[256];
+    const char *p=path;
+    while (*p) {
+        while (*p=='/') ++p;
+        if (!*p) break;
+        const char *end=strchr(p,'/');
+        size_t len=end ? (size_t)(end-p) : strlen(p);
+        if (len>=sizeof(part)) return 0;
+        memcpy(part,p,len); part[len]=0;
+        if ((size_t)snprintf(trial,sizeof(trial),"%s/%s",out,part)>=sizeof(trial)) return 0;
+        if (access(trial,F_OK)) {
+            DIR *d=opendir(out[0] ? out : "/");
+            if (!d) return 0;
+            int found=0;
+            for (struct dirent *e;(e=readdir(d));)
+                if (!strcasecmp(e->d_name,part)) { snprintf(trial,sizeof(trial),"%s/%s",out,e->d_name); found=1; break; }
+            closedir(d);
+            if (!found) return 0;
+        }
+        memcpy(out,trial,strlen(trial)+1);
+        p+=len;
+    }
+    if (!strcmp(out,path) || strlen(out)!=strlen(path)) return 0;
+    memcpy(path,out,strlen(out)+1);
+    return 1;
 }
 static int host_flags(int flags) {
     int r;
@@ -191,9 +210,6 @@ static int host_flags(int flags) {
     if (flags&0x400) r|=O_TRUNC;
     if (flags&0x800) r|=O_EXCL;
     if (flags&0x20000) r|=O_DIRECTORY;
-#ifdef _WIN32
-    r|=O_BINARY;
-#endif
     return r|O_CLOEXEC;
 }
 static void free_listing(Listing *l) { if (l) { free(l->names); free(l->offsets); free(l->types); free(l); } }
@@ -204,6 +220,7 @@ static Listing *list_directory(const char *path) {
     size_t capacity=0,bytes=0,cap_names=0;
     struct dirent *e;
     while (l && (e=readdir(d))) {
+        if (temp_name(e->d_name)) continue;
         size_t n=strlen(e->d_name)+1;
         if (l->count==capacity) {
             capacity=capacity ? capacity*2 : 64;
@@ -214,12 +231,6 @@ static Listing *list_directory(const char *path) {
         if (!l->offsets || !l->types || !l->names) { fputs("Out of memory listing directory\n",stderr); exit(1); }
         memcpy(l->names+bytes,e->d_name,n);
         l->offsets[l->count]=bytes;
-#ifdef _WIN32
-        /* MinGW's dirent has no d_type. */
-        char child[1100]; HostStat entry;
-        snprintf(child,sizeof(child),"%s/%s",path,e->d_name);
-        l->types[l->count]=host_stat(child,&entry) ? 0 : S_ISDIR(entry.st_mode) ? 4 : S_ISREG(entry.st_mode) ? 8 : 0;
-#else
         unsigned char type=e->d_type;
         if (type==DT_LNK || type==DT_UNKNOWN) {
             struct stat entry;
@@ -227,31 +238,19 @@ static Listing *list_directory(const char *path) {
                 type=S_ISDIR(entry.st_mode) ? DT_DIR : S_ISREG(entry.st_mode) ? DT_REG : type;
         }
         l->types[l->count]=type==DT_DIR ? 4 : type==DT_REG ? 8 : type==DT_LNK ? 10 : 0;
-#endif
         ++l->count; bytes+=n;
     }
     closedir(d);
     return l;
 }
-static void convert_stat(const HostStat *s,GuestStat *g) {
+static void convert_stat(const struct stat *s,GuestStat *g) {
     memset(g,0,sizeof(*g));
     g->dev=(uint32_t)s->st_dev; g->ino=(uint32_t)s->st_ino;
-    g->nlink=(uint16_t)s->st_nlink;
-    g->size=s->st_size;
-#ifdef _WIN32
-    /* FreeBSD mode bits: directories rwxr-xr-x, files rw-r--r--. */
-    g->mode=(uint16_t)(S_ISDIR(s->st_mode) ? 0040755 : 0100644);
-    g->blocks=(s->st_size+511)/512; g->blksize=4096;
-    g->atime=(GuestTimespec){s->st_atime,0};
-    g->mtime=(GuestTimespec){s->st_mtime,0};
-    g->ctime=(GuestTimespec){s->st_ctime,0};
-#else
-    g->mode=(uint16_t)s->st_mode;
-    g->blocks=s->st_blocks; g->blksize=(uint32_t)s->st_blksize;
+    g->mode=(uint16_t)s->st_mode; g->nlink=(uint16_t)s->st_nlink;
+    g->size=s->st_size; g->blocks=s->st_blocks; g->blksize=(uint32_t)s->st_blksize;
     g->atime=(GuestTimespec){s->st_atim.tv_sec,s->st_atim.tv_nsec};
     g->mtime=(GuestTimespec){s->st_mtim.tv_sec,s->st_mtim.tv_nsec};
     g->ctime=(GuestTimespec){s->st_ctim.tv_sec,s->st_ctim.tv_nsec};
-#endif
     g->birthtime=g->ctime;
 }
 static File *get(int fd) {
@@ -260,6 +259,8 @@ static File *get(int fd) {
 }
 /* BB_AUDIO_TRACE=1: sound file opens and failed reads (missing game sounds). */
 static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_AUDIO_TRACE"); v=e && e[0]=='1'; } return v; }
+/* BB_SAVE_TRACE=1: every operation on save files (/savedataN). */
+static int save_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_SAVE_TRACE"); v=e && e[0]=='1'; } return v; }
 /* Game mounts (including linked mod overlays) are read-only. Saves use other mounts. */
 static int game_path(const char *p) {
     if (!p || !*p) return 0;
@@ -267,18 +268,16 @@ static int game_path(const char *p) {
     return (!strncmp(p,"/app0",5) && (!p[5] || p[5]=='/')) ||
            (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
 }
-/* BB_SAVE_TRACE=1: every operation on save files (/savedataN). */
-static int save_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_SAVE_TRACE"); v=e && e[0]=='1'; } return v; }
 /* Saves (/savedataN): see File. The copy starts as the old file unless the open truncates. */
 static unsigned temp_serial;
 static int copy_contents(int from,int to) {
     char buffer[65536];
     for (;;) {
-        int n=(int)read(from,buffer,sizeof(buffer));
+        ssize_t n=read(from,buffer,sizeof(buffer));
         if (n<0 && errno==EINTR) continue;
         if (n<=0) return n<0 ? -1 : 0;
-        for (int done=0; done<n;) {
-            int w=(int)write(to,buffer+done,(unsigned)(n-done));
+        for (ssize_t done=0; done<n;) {
+            ssize_t w=write(to,buffer+done,(size_t)(n-done));
             if (w<0 && errno==EINTR) continue;
             if (w<0) return -1;
             done+=w;
@@ -295,34 +294,20 @@ static void current_copy(char *path,size_t size,int write) {
 }
 /* Returns the descriptor of the copy, or -(errno). */
 static int open_for_commit(const char *path,const char *source,int flags,int mode,char **commit,char **temp) {
-    int hf=host_flags(flags)&~O_DIRECTORY;
-#ifdef _WIN32
-    const int file_mode=_S_IREAD|_S_IWRITE;
-    (void)mode;
-#else
-    const int file_mode=mode ? mode : 0644;
-#endif
+    int hf=host_flags(flags);
     struct stat s;
     int exists=!stat(source,&s);
-    if (exists && !S_ISREG(s.st_mode)) { int h=open(path,hf,file_mode); return h<0 ? -errno : h; }
+    if (exists && !S_ISREG(s.st_mode)) { int h=open(path,hf,mode ? mode : 0644); return h<0 ? -errno : h; }
     if (exists && (hf&O_CREAT) && (hf&O_EXCL)) return -EEXIST;
     if (!exists && !(hf&O_CREAT)) return -ENOENT;
     size_t n=strlen(path)+32;
     char *t=malloc(n), *c=strdup(path);
     if (!t || !c) { free(t); free(c); return -ENOMEM; }
     snprintf(t,n,"%s.%u.bbtmp",path,__atomic_add_fetch(&temp_serial,1,__ATOMIC_RELAXED));
-#ifdef _WIN32
-    int out=open(t,O_WRONLY|O_CREAT|O_TRUNC|O_BINARY,file_mode);
-#else
-    int out=open(t,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,exists ? (int)(s.st_mode&07777) : file_mode);
-#endif
+    int out=open(t,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,exists ? (int)(s.st_mode&07777) : mode ? mode : 0644);
     int e=out<0 ? errno : 0;
     if (!e && exists && !(hf&O_TRUNC)) {
-#ifdef _WIN32
-        int in=open(source,O_RDONLY|O_BINARY);
-#else
         int in=open(source,O_RDONLY|O_CLOEXEC);
-#endif
         if (in<0 || copy_contents(in,out)) e=errno ? errno : EIO;
         if (in>=0) close(in);
     }
@@ -336,87 +321,187 @@ static int open_for_commit(const char *path,const char *source,int flags,int mod
     *commit=c; *temp=t;
     return host;
 }
+static void sync_directory(const char *file) {
+    char dir[1024];
+    snprintf(dir,sizeof(dir),"%s",file);
+    char *slash=strrchr(dir,'/');
+    if (!slash) return;
+    *slash=0;
+    int d=open(dir,O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if (d>=0) { fsync(d); close(d); }
+}
 static int commit_file(const File *f) {
     if (!f->dirty) { close(f->host); unlink(f->temp); return 0; } /* opened for writing, not written */
     int e=fsync(f->host) ? errno : 0;
     close(f->host);
-#ifdef _WIN32
-    /* POSIX rename replaces the old file in one step; MoveFileEx does with REPLACE_EXISTING. */
-    if (!e && !MoveFileExA(f->temp,f->commit,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))
-        e=compat_errno_from_win32(GetLastError());
-#else
     if (!e && rename(f->temp,f->commit)) e=errno;
-#endif
     if (e) {
         fprintf(stderr,"Runtime: save file %s not replaced (%s); the old one is kept\n",f->path,strerror(e));
         unlink(f->temp);
         return -e;
     }
-#ifndef _WIN32
-    char dir[1024];
-    snprintf(dir,sizeof(dir),"%s",f->commit);
-    char *slash=strrchr(dir,'/');
-    if (slash) {
-        *slash=0;
-        int d=open(dir,O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-        if (d>=0) { fsync(d); close(d); }
-    }
-#endif
+    sync_directory(f->commit);
     return 0;
 }
+/* The game's option pages (menu/optionsetting.gfx, Scaleform): the ControllSetting layout
+ * (sprite "_Option_ItemList_71", rows Item_0_0 .. Item_6_0) stacks its rows upwards, a later row
+ * drawn over an earlier one, and a row's pop-up list showed the rows below it through. The port's
+ * settings page (gpu/shim/bbport_game_menu.cpp) has pop-up rows there: the copy the game reads has
+ * these rows' depths reversed, as the game's own LanguageSetting layout (made for pop-up rows)
+ * has them. Only those depths change; anything unexpected in the file: the file as it is.
+ * BB_GAME_MENU=0 (no port pages) leaves it alone too. */
+typedef struct { const uint8_t *p; size_t bit; } Bits;
+static unsigned bits_read(Bits *b,int n) {
+    unsigned v=0;
+    while (n--) { v=v<<1 | ((b->p[b->bit>>3]>>(7-(b->bit&7)))&1); ++b->bit; }
+    return v;
+}
+/* A tag at `at` of `buf` (up to `end`): its code, body and the next tag. */
+static int swf_tag(const uint8_t *buf,size_t at,size_t end,unsigned *code,size_t *body,size_t *len,size_t *next) {
+    if (at+2>end) return 0;
+    unsigned v=buf[at] | buf[at+1]<<8;
+    *code=v>>6; *len=v&0x3f; *body=at+2;
+    if (*len==0x3f) {
+        if (at+6>end) return 0;
+        *len=buf[at+2] | buf[at+3]<<8 | buf[at+4]<<16 | (size_t)buf[at+5]<<24;
+        *body=at+6;
+    }
+    *next=*body+*len;
+    return *next<=end;
+}
+/* The depth field of a placing or removing tag in a sprite, or NULL. */
+static uint8_t *swf_depth(uint8_t *buf,unsigned code,size_t body,size_t len) {
+    if ((code==26 || code==28) && len>=(code==26 ? 3u : 2u)) return buf+body+(code==26 ? 1 : 0);
+    if (code==70 && len>=4) return buf+body+2;
+    if (code==5 && len>=4) return buf+body+2;
+    return NULL;
+}
+/* PlaceObject2/3's instance name ("Item_3_0"), or NULL. */
+static const char *swf_place_name(const uint8_t *t,unsigned code,size_t len) {
+    size_t p=code==70 ? 2 : 1;
+    unsigned flags=t[0], flags2=code==70 ? t[1] : 0;
+    p+=2;                                        /* depth */
+    if (code==70 && (flags2&0x08)) { while (p<len && t[p]) ++p; ++p; } /* class name */
+    if (flags&0x02) p+=2;                        /* character id */
+    if (!(flags&0x20) || p>=len) return NULL;
+    Bits b={t,p*8};
+    if (flags&0x04) {                            /* matrix */
+        if (bits_read(&b,1)) { int n=bits_read(&b,5); bits_read(&b,n); bits_read(&b,n); }
+        if (bits_read(&b,1)) { int n=bits_read(&b,5); bits_read(&b,n); bits_read(&b,n); }
+        int n=bits_read(&b,5); bits_read(&b,n); bits_read(&b,n);
+        p=(b.bit+7)/8;
+    }
+    if (flags&0x08) {                            /* color transform with alpha */
+        b.bit=p*8;
+        int add=bits_read(&b,1), mult=bits_read(&b,1), n=bits_read(&b,4);
+        if (mult) for (int i=0;i<4;++i) bits_read(&b,n);
+        if (add) for (int i=0;i<4;++i) bits_read(&b,n);
+        p=(b.bit+7)/8;
+    }
+    if (flags&0x10) p+=2;                        /* ratio */
+    if (p>=len || !memchr(t+p,0,len-p)) return NULL;
+    return (const char *)t+p;
+}
+/* Reverses the item rows' depths of the ControllSetting layout in `buf` (an uncompressed GFX). */
+static int fix_option_layout(uint8_t *buf,size_t size) {
+    if (size<16 || memcmp(buf,"GFX",3)) return 0;
+    const size_t rect=(5+4*(buf[8]>>3)+7)/8, first=8+rect+4;
+    static const char wanted[]="OptionSetting_fla._Option_ItemList_71";
+    unsigned code; size_t body,len,next;
+    long sprite=-1;
+    for (size_t at=first; swf_tag(buf,at,size,&code,&body,&len,&next) && code; at=next) {
+        if (code!=76 || len<2) continue;          /* SymbolClass: ids and class names */
+        size_t p=body+2;
+        for (unsigned i=0,n=buf[body] | buf[body+1]<<8; i<n && p+2<next; ++i) {
+            unsigned id=buf[p] | buf[p+1]<<8;
+            const char *name=(const char *)buf+p+2;
+            if (!memchr(name,0,next-p-2)) return 0;
+            if (!strcmp(name,wanted)) sprite=id;
+            p+=2+strlen(name)+1;
+        }
+    }
+    if (sprite<0) return 0;
+    for (size_t at=first; swf_tag(buf,at,size,&code,&body,&len,&next) && code; at=next) {
+        if (code!=39 || len<4 || (buf[body] | buf[body+1]<<8)!=sprite) continue;
+        /* The items' depths as placed (frame 0), Item_0_0 .. Item_6_0. */
+        unsigned depth[7]={0};
+        size_t inner,ilen,inext;
+        unsigned c;
+        for (size_t t=body+4; swf_tag(buf,t,next,&c,&inner,&ilen,&inext) && c && c!=1; t=inext) {
+            if (c!=26 && c!=70) continue;
+            const char *name=swf_place_name(buf+inner,c,ilen);
+            const uint8_t *d=swf_depth(buf,c,inner,ilen);
+            if (name && d && !strncmp(name,"Item_",5) && name[5]>='0' && name[5]<='6' && !strcmp(name+6,"_0"))
+                depth[name[5]-'0']=d[0] | d[1]<<8;
+        }
+        for (int i=0;i<7;++i) if (!depth[i] || (i && depth[i]<=depth[i-1])) return 0;
+        for (size_t t=body+4; swf_tag(buf,t,next,&c,&inner,&ilen,&inext) && c; t=inext) {
+            uint8_t *d=swf_depth(buf,c,inner,ilen);
+            if (!d) continue;
+            const unsigned v=d[0] | d[1]<<8;
+            for (int i=0;i<7;++i) {
+                if (v==depth[i]) { d[0]=depth[6-i]&0xff; d[1]=depth[6-i]>>8; break; }
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+/* The host file for `guest`: a fixed copy (a memfd) for the option layouts, else `host`. */
+static int menu_layout_file(const char *guest,int host) {
+    static const char suffix[]="/menu/optionsetting.gfx";
+    const char *env=getenv("BB_GAME_MENU");
+    const size_t n=strlen(guest), k=sizeof(suffix)-1;
+    if ((env && env[0]=='0') || n<k || strcasecmp(guest+n-k,suffix)) return host;
+    struct stat s;
+    if (fstat(host,&s) || s.st_size<=0 || s.st_size>(16<<20)) return host;
+    uint8_t *buf=malloc((size_t)s.st_size);
+    if (!buf) return host;
+    if (pread(host,buf,(size_t)s.st_size,0)!=s.st_size || !fix_option_layout(buf,(size_t)s.st_size)) {
+        free(buf); return host;
+    }
+    int fixed=memfd_create("optionsetting.gfx",MFD_CLOEXEC);
+    if (fixed<0 || write(fixed,buf,(size_t)s.st_size)!=s.st_size || lseek(fixed,0,SEEK_SET)) {
+        if (fixed>=0) close(fixed);
+        free(buf); return host;
+    }
+    free(buf);
+    close(host);
+    static int told;
+    if (!__atomic_exchange_n(&told,1,__ATOMIC_RELAXED))
+        printf("Runtime: %s: the settings rows stack downwards (pop-up lists cover the rows below)\n",guest);
+    return fixed;
+}
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */
+/* The host file a guest path opens (mods and case included), for the GPU side reading the game's
+ * own files (gpu/: button prompt icons). 0 or a host errno. */
+int runtime_file_host_path(const char *guest,char *out,size_t size) {
+    const int e=translate(guest,out,size);
+    if (e) return e;
+    if (access(out,F_OK)!=0 && !fix_case(out)) return ENOENT;
+    return 0;
+}
 static int64_t do_open(const char *guest,int flags,int mode) {
     runtime_quit_on_open(guest);
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
-    char *commit=NULL, *temp=NULL;
-#ifdef _WIN32
-    /* Windows cannot open a directory as a CRT descriptor: directories are listings only. */
-    (void)mode;
-    HostStat s;
-    Listing *dir=NULL;
-    int host=-1;
-    if (!host_stat(path,&s) && S_ISDIR(s.st_mode)) {
-        if (flags&3) return -EISDIR;
-        if (!(dir=list_directory(path))) return -EACCES;
-    } else if (flags&0x20000) {
-        e=errno==ENOENT ? ENOENT : ENOTDIR;
-        if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
-        return -e;
-    } else {
-        if (save_path(guest) && (flags&3)) {
-            char current[1024];
-            snprintf(current,sizeof(current),"%s",path);
-            current_copy(current,sizeof(current),0);
-            host=open_for_commit(path,current,flags,mode,&commit,&temp);
-            if (host<0) { errno=-host; host=-1; }
-        } else {
-            if (save_path(guest)) current_copy(path,sizeof(path),0);
-            host=open(path,host_flags(flags)&~O_DIRECTORY,_S_IREAD|_S_IWRITE);
-        }
-        if (save_trace() && save_path(guest))
-            printf("Save trace: open(%s, flags 0x%x) -> host %d%s%s\n",guest,flags,host,temp ? ", copy " : "",temp ? temp : "");
-        if (host<0) {
-            e=errno;
-            if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
-            return -e;
-        }
-        if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
-    }
-#else
+    char *commit=NULL, *temp=NULL, current[1024];
+    snprintf(current,sizeof(current),"%s",path);
+    if (save_path(guest)) current_copy(current,sizeof(current),0);
     int host;
     if (save_path(guest) && (flags&3)) {
-        char current[1024];
-        snprintf(current,sizeof(current),"%s",path);
-        current_copy(current,sizeof(current),0);
         host=open_for_commit(path,current,flags,mode,&commit,&temp);
         if (host<0) { errno=-host; host=-1; }
     } else {
-        if (save_path(guest)) current_copy(path,sizeof(path),0);
-        host=open(path,host_flags(flags),mode ? mode : 0644);
+        host=open(current,host_flags(flags),mode ? mode : 0644);
+        if (host<0 && errno==ENOENT && !(flags&0x200) && !save_path(guest) && fix_case(current)) {
+            host=open(current,host_flags(flags),mode ? mode : 0644);
+            snprintf(path,sizeof(path),"%s",current); // the directory listing below uses it
+        }
     }
+    if (host>=0 && !(flags&3) && game_path(guest)) host=menu_layout_file(guest,host);
     if (save_trace() && save_path(guest))
         printf("Save trace: open(%s, flags 0x%x) -> host %d%s%s\n",guest,flags,host,temp ? ", copy " : "",temp ? temp : "");
     if (host<0) {
@@ -427,12 +512,11 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     struct stat s;
     Listing *dir=NULL;
     if (!fstat(host,&s) && S_ISDIR(s.st_mode)) dir=list_directory(path);
-#endif
     pthread_mutex_lock(&lock);
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
     if (fd<0) {
-        pthread_mutex_unlock(&lock); if (host>=0) close(host); free_listing(dir);
+        pthread_mutex_unlock(&lock); close(host); free_listing(dir);
         if (temp) unlink(temp);
         free(commit); free(temp); return -EMFILE;
     }
@@ -452,6 +536,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
                 printf("Mods: open %s -> %s\n",guest,actual);
         }
     }
+    if (save_trace() && save_path(guest)) printf("Save trace: open(%s) -> fd %d\n",guest,fd);
     return fd;
 }
 static int64_t do_close(int fd) {
@@ -465,7 +550,7 @@ static int64_t do_close(int fd) {
     free_listing(closed.dir);
     int result=0;
     if (closed.temp) result=commit_file(&closed);
-    else if (closed.host>=0) close(closed.host);
+    else close(closed.host);
     if (save_trace() && save_path(closed.path))
         printf("Save trace: close(fd %d, %s)%s -> %d\n",fd,closed.path,closed.temp ? closed.dirty ? " commit" : " unwritten" : "",result);
     free(closed.commit); free(closed.temp);
@@ -484,17 +569,9 @@ static int host_fd_written(int fd) {
     f->dirty=1;
     return f->host;
 }
-#ifdef _WIN32
-/* The CRT reads and writes at most INT_MAX bytes per call. */
-static ssize_t host_read(int h,void *buffer,uint64_t size) { return read(h,buffer,(unsigned)(size>0x7ffff000 ? 0x7ffff000 : size)); }
-static ssize_t host_write(int h,const void *buffer,uint64_t size) { return write(h,buffer,(unsigned)(size>0x7ffff000 ? 0x7ffff000 : size)); }
-#else
-#define host_read read
-#define host_write write
-#endif
-/* Pages of the destination may be write-protected for GPU tracking: the kernel's copy then
- * fails with EFAULT instead of faulting to our handler. A user-mode write to each page first
- * goes through the handler, which unprotects it (and records the upcoming write). */
+/* The GPU side is told of the write first (runtime_memory_note_write: its tracking unprotects the
+ * range). Pages protected again meanwhile would make the kernel's copy fail with EFAULT instead
+ * of faulting to our handler: a user-mode write to each page first goes through the handler. */
 static void touch_for_write(void *buffer,uint64_t size) {
     if (!size) return;
     uintptr_t p=(uintptr_t)buffer & ~(uintptr_t)4095, end=(uintptr_t)buffer+size;
@@ -503,28 +580,59 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
+/* A page protected again between the touch and the kernel's copy (the GPU side re-arms its write
+ * traps): EFAULT with nothing read. Touched again, the read is tried again a few times. */
+static ssize_t read_retrying(int h,void *buffer,uint64_t size,int64_t offset,int positional) {
+    ssize_t n=-1;
+#ifdef _WIN32
+    if (size>0x7ffff000) size=0x7ffff000; /* the CRT's read takes at most INT_MAX bytes */
+#endif
+    for (int attempt=0; attempt<8; ++attempt) {
+        n=positional ? pread(h,buffer,size,offset) : read(h,buffer,size);
+        if (n>=0 || errno!=EFAULT) break;
+        touch_for_write(buffer,size);
+    }
+    return n;
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
-    ssize_t n=host_read(h,buffer,size);
+    ssize_t n=read_retrying(h,buffer,size,0,0);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
+    if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
-    ssize_t n=pread(h,buffer,size,offset);
+    ssize_t n=read_retrying(h,buffer,size,offset,1);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
+    if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
+}
+/* Pages the GPU side keeps without access (data newer in VRAM, runtime_memory_trap reasons from
+ * 16 up) would make the kernel's copy fail with EFAULT: a user-mode read of each page first goes
+ * through the handler, which copies the data back. */
+static void touch_for_read(const void *buffer,uint64_t size) {
+    if (!size) return;
+    uintptr_t p=(uintptr_t)buffer & ~(uintptr_t)4095, end=(uintptr_t)buffer+size;
+    for (; p<end; p+=4096)
+        (void)*(volatile const unsigned char *)(p<(uintptr_t)buffer ? (uintptr_t)buffer : p);
 }
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
-    ssize_t n=host_write(h,buffer,size);
+    touch_for_read(buffer,size);
+#ifdef _WIN32
+    if (size>0x7ffff000) size=0x7ffff000; /* the CRT's write takes at most INT_MAX bytes */
+#endif
+    ssize_t n=write(h,buffer,size);
     if (n<0) return -errno;
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
     return n;
@@ -532,10 +640,12 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
 static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
+    touch_for_read(buffer,size);
     ssize_t n=pwrite(h,buffer,size,offset);
     return n<0 ? -errno : n;
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {
+    if (save_trace()) { File *t=get(fd); if (t && save_path(t->path)) printf("Save trace: lseek(fd %d, %lld, %d)\n",fd,(long long)offset,whence); }
     File *f=get(fd);
     if (!f) return -EBADF;
     if (whence<0 || whence>2) return -EINVAL;
@@ -544,34 +654,28 @@ static int64_t do_lseek(int fd,int64_t offset,int whence) {
         if (whence==0 && offset>=0) { f->position=(size_t)offset; return offset; }
         return -EINVAL;
     }
-    int64_t r=host_lseek(f->host,offset,whence);
+    off_t r=lseek(f->host,offset,whence);
     return r<0 ? -errno : r;
 }
 static int64_t do_fstat(int fd,GuestStat *out) {
+    if (save_trace()) { File *t=get(fd); if (t && save_path(t->path)) printf("Save trace: fstat(fd %d)\n",fd); }
     int h=host_fd(fd);
-    HostStat s;
-#ifdef _WIN32
-    if (h<0) { /* directory: a listing only, stat the path it was opened with */
-        File *f=get(fd); char path[1024];
-        if (!f || !f->dir) return -EBADF;
-        if (!out) return -EFAULT;
-        if (translate(f->path,path,sizeof(path)) || host_stat(path,&s)) return -EBADF;
-        convert_stat(&s,out); return 0;
-    }
-#else
     if (h<0) return -EBADF;
-#endif
     if (!out) return -EFAULT;
-    if (host_fstat(h,&s)) return -errno;
+    struct stat s;
+    if (fstat(h,&s)) return -errno;
     convert_stat(&s,out); return 0;
 }
 static int64_t do_stat(const char *guest,GuestStat *out) {
-    char path[1024]; HostStat s;
+    char path[1024]; struct stat s;
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     if (save_path(guest)) current_copy(path,sizeof(path),0);
     if (!out) return -EFAULT;
-    if (host_stat(path,&s)) return -errno;
+    int r=stat(path,&s) ? -errno : 0;
+    if (r==-ENOENT && !save_path(guest) && fix_case(path)) r=stat(path,&s) ? -errno : 0;
+    if (save_trace() && save_path(guest)) printf("Save trace: stat(%s) -> %d, %lld bytes\n",guest,r,r ? -1LL : (long long)s.st_size);
+    if (r) return r;
     convert_stat(&s,out); return 0;
 }
 static int64_t do_getdents(int fd,char *buffer,uint64_t size,int64_t *basep) {
@@ -609,7 +713,9 @@ static int64_t path_op(const char *guest,int op,int mode) {
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     int r= op==0 ? mkdir(path,mode ? mode : 0755) : op==1 ? rmdir(path) : unlink(path);
-    return r ? -errno : 0;
+    r=r ? -errno : 0;
+    if (save_trace() && save_path(guest)) printf("Save trace: %s(%s) -> %d\n",op==0 ? "mkdir" : op==1 ? "rmdir" : "unlink",guest,r);
+    return r;
 }
 static int64_t do_rename(const char *from,const char *to) {
     if (game_path(from) || game_path(to)) return -EROFS;
@@ -617,21 +723,14 @@ static int64_t do_rename(const char *from,const char *to) {
     int e=translate(from,a,sizeof(a));
     if (!e) e=translate(to,b,sizeof(b));
     if (e) return -e;
-#ifdef _WIN32
-    /* POSIX rename replaces an existing target; the CRT's fails. */
-    return MoveFileExA(a,b,MOVEFILE_REPLACE_EXISTING) ? 0 : -compat_errno_from_win32(GetLastError());
-#else
-    return rename(a,b) ? -errno : 0;
-#endif
+    int r=rename(a,b) ? -errno : 0;
+    if (save_trace() && (save_path(from) || save_path(to))) printf("Save trace: rename(%s, %s) -> %d\n",from,to,r);
+    return r;
 }
 static int64_t do_ftruncate(int fd,int64_t length) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
-#ifdef _WIN32
-    return _chsize_s(h,length) ? -errno : 0;
-#else
     return ftruncate(h,length) ? -errno : 0;
-#endif
 }
 static int64_t do_truncate(const char *guest,int64_t length) {
     if (game_path(guest)) return -EROFS;
@@ -639,15 +738,8 @@ static int64_t do_truncate(const char *guest,int64_t length) {
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     if (save_path(guest)) current_copy(path,sizeof(path),1);
-#ifdef _WIN32
-    int h=open(path,O_RDWR|O_BINARY);
-    if (h<0) return -errno;
-    int r=_chsize_s(h,length) ? -errno : 0;
-    close(h);
-    return r;
-#else
+    if (save_trace() && save_path(guest)) printf("Save trace: truncate(%s, %lld)\n",guest,(long long)length);
     return truncate(path,length) ? -errno : 0;
-#endif
 }
 static int64_t do_fsync(int fd) { int h=host_fd(fd); if (h<0) return -EBADF; return fsync(h) ? -errno : 0; }
 static int64_t do_access(const char *guest,int mode) {
@@ -656,10 +748,11 @@ static int64_t do_access(const char *guest,int mode) {
     if (e) return -e;
     if (save_path(guest)) current_copy(path,sizeof(path),0);
 #ifdef _WIN32
-    return access(path,mode&6) ? -errno : 0; /* X_OK is invalid for the CRT */
-#else
-    return access(path,mode&7) ? -errno : 0;
+    mode&=6; /* X_OK is invalid for the CRT's access */
 #endif
+    int r=access(path,mode&7) ? -errno : 0;
+    if (r==-ENOENT && !save_path(guest) && fix_case(path)) r=access(path,mode&7) ? -errno : 0;
+    return r;
 }
 
 /* Convention adapters: sceKernel* -> Orbis error codes, POSIX -> -1 + errno. */
@@ -729,4 +822,3 @@ void runtime_file_report(void) {
     printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu\n",
            opens,reads,(unsigned long long)bytes_read,writes,missing);
 }
-

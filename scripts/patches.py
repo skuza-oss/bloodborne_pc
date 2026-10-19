@@ -15,7 +15,19 @@ from pathlib import Path
 
 EBOOT_BASE=0x400000
 # BB_FPS presets: patch names from patches/Bloodborne.xml (app version 01.09).
-FPS_PRESETS={'30':[],'60':['60 FPS++'],'90':['90 FPS++'],'uncap':['Uncap FPS++']}
+# Above 60 FPS the sprint fix always goes with the frame rate patch: without it sprinting drops to
+# half speed (the game's wall detector measured distance per frame, a 30 FPS rule).
+FPS_PRESETS={'30':[],'60':['60 FPS++'],'90':['90 FPS++','Sprint Fix (High FPS)'],
+             'uncap':['Uncap FPS++','Sprint Fix (High FPS)']}
+# Above 30 FPS the frame rate is done by hooks in the game's code (gpu/shim/bbport_frame_rate.cpp:
+# 60 and 90 are the same as uncap, at most that many frames a second): no patches. The patches
+# only with BB_FRAME_HOOKS=0 (comparisons).
+
+
+def fps_patches(fps, env=os.environ):
+    if fps!='30' and env.get('BB_FRAME_HOOKS','1')!='0':
+        return []
+    return FPS_PRESETS[fps]
 # Upscaler presets (bbport.ini "preset", the in-game menu): output / render size ratio. The game
 # then renders at 1920x1080 / ratio and the port's temporal upscaler restores the output size.
 OUTPUT_SIZE=(1920,1080)
@@ -42,6 +54,7 @@ EFFECTS={
     'effect_game_aa':('Disable AA',None),
     'effect_dynamic_shadows':('Disable Dynamic Light Shadows (perf increase)',None),
     'effect_ssr':(None,'Enable Screen Space Reflections (READ NOTE)'),
+    'effect_bloom':('Disable Bloom',None),
     'skip_intro':(None,'Skip Intro'),
     'debug_camera':(None,'Restore Debug Camera'),
     'debug_menu':(None,'Restore Debug Menu (READ NOTES)'),
@@ -58,6 +71,44 @@ EFFECTS={
     'tweak_ragdoll':(None,'DS1-like physics'),
     'tweak_circle_confirm':(None,'Circle Confirm (Japanese/Asian button layout)'),
 }
+# Intel CPUs: the game's tone mapping turns black (DLC areas most; reported as darker than on the
+# PS4): the game code runs natively, and Intel's approximate float instructions differ from the
+# PS4's AMD CPU, so a block the game gates on a computed flag never runs. The community fix runs
+# it always; on by default on Intel. BB_INTEL_TONEMAP_FIX=0/1 forces it off or on.
+INTEL_TONEMAP='Intel Black Tonemap Fix'
+
+
+def intel_cpu(cpuinfo='/proc/cpuinfo'):
+    if sys.platform=='win32' and cpuinfo=='/proc/cpuinfo':  # no /proc on Windows
+        return 'GenuineIntel' in os.environ.get('PROCESSOR_IDENTIFIER','')
+    try:
+        with open(cpuinfo) as f:
+            return any(line.startswith('vendor_id') and 'GenuineIntel' in line for line in f)
+    except OSError:
+        return False
+
+
+# The title's PLAY ONLINE / PLAY OFFLINE dialog: the port has no PSN, the game goes straight to the
+# main menu offline. On by default (the launcher's switch); BB_SKIP_NETWORK_CHOICE=0 shows it.
+SKIP_NETWORK_CHOICE='Skip Online/Offline Choice'
+
+
+def skip_network_choice(env=os.environ):
+    return env.get('BB_SKIP_NETWORK_CHOICE','1')!='0'
+
+
+# Two per-frame GX command heaps: the game writes through NULL when a 256 KiB heap fills (#162).
+GX_COMMAND_HEAP='Larger GX Per-Frame Command Heap'
+
+
+def gx_command_heap(env=os.environ):
+    return env.get('BB_GX_COMMAND_HEAP','1')!='0'
+
+
+def intel_tonemap_fix(env=os.environ, cpuinfo='/proc/cpuinfo'):
+    forced=env.get('BB_INTEL_TONEMAP_FIX')
+    return forced=='1' if forced in ('0','1') else intel_cpu(cpuinfo)
+
 # model_lod: -2 highest, 0 the game's, 1 lower, 2 lowest.
 MODEL_LOD={'-2':'Model LOD -2 (Highest)','1':'Model LOD 1 (Lower)','2':'Model LOD 2 (Lowest)'}
 
@@ -71,24 +122,81 @@ def game_app_version(game):
         return None
 
 
+DEBUG_MENU='Restore Debug Menu (READ NOTES)'
+# What the patched game reads for the debug menu (BB_FILE_TRACE=1), under dvdroot_ps4. The game asks
+# for lower-case names; the PS4's file system and the port's runtime ignore case.
+DEBUG_MENU_FONTS=('adhoc/font/DbgFont14h.ccm','adhoc/font/DbgFont14h.tpf')
+DEBUG_MENU_SHADERS=('adhoc/FontShader/debugFont_vs.vpo','adhoc/FontShader/debugFont_ps.ppo')
+
+
+def find_ignoring_case(root, relative):
+    """`root`/`relative`, each component matched ignoring case; None when absent."""
+    path=Path(root)
+    for part in relative.split('/'):
+        exact=path/part
+        if exact.exists():
+            path=exact
+            continue
+        try:
+            matches=[e for e in path.iterdir() if e.name.casefold()==part.casefold()]
+        except OSError:
+            return None
+        if not matches:
+            return None
+        path=matches[0]
+    return path
+
+
+def debug_menu_problem(game):
+    """Why the debug menu patch cannot work with this game folder, or None."""
+    dvdroot=Path(game)/'dvdroot_ps4'
+    missing=[]
+    for relative in DEBUG_MENU_FONTS:
+        found=find_ignoring_case(dvdroot,relative)
+        if not found or not found.is_file() or found.stat().st_size==0:
+            missing.append(relative)
+    if not missing:
+        return None
+    hint=''
+    if all(find_ignoring_case(dvdroot,'font/'+r.rsplit('/',1)[1]) for r in missing):
+        hint=' (they are in dvdroot_ps4/font: the game reads them from dvdroot_ps4/adhoc/font)'
+    return ('the debug menu needs the font files from https://www.nexusmods.com/bloodborne/mods/253 '
+            f'in dvdroot_ps4 of the game folder or of a mod: missing {", ".join(missing)}{hint}')
+
+
 def validate_patch_requirements(names, game):
+    """The patches to apply: raises for conflicts; drops the debug menu (with a message) when its
+    font files are missing, as the game crashes opening the menu without them."""
     if 'Restore Debug Camera' in names and 'Enemy Control' in names:
         raise ValueError('Restore Debug Camera conflicts with Enemy Control; enable only one')
-    if 'Restore Debug Menu (READ NOTES)' in names:
-        font = game / 'dvdroot_ps4/font'
-        missing = [name for name in ('DbgFont14h.ccm', 'DbgFont14h.tpf')
-                   if not (font / name).is_file() or (font / name).stat().st_size == 0]
-        if missing:
-            raise ValueError('Debug menu needs non-empty font files in '
-                             f'{font}: {", ".join(missing)}. Install the fonts from '
-                             'https://www.nexusmods.com/bloodborne/mods/253 first; '
-                             'or disable debug_menu in bbport.ini')
+    if DEBUG_MENU in names:
+        problem=debug_menu_problem(game)
+        if problem:
+            print(f'Patches: debug menu off: {problem}',file=sys.stderr)
+            return [n for n in names if n!=DEBUG_MENU]
+        absent=[r for r in DEBUG_MENU_SHADERS if not find_ignoring_case(Path(game)/'dvdroot_ps4',r)]
+        if absent:
+            print(f'Patches: debug menu: {", ".join(absent)} not found (the mod\'s font shaders); '
+                  'the menu may not draw',file=sys.stderr)
+    return names
 
 
-def effect_patches(settings):
+# Effects the engine switches live (gpu/shim bbport_guest_hooks.cpp, "game effects switched live"):
+# they get no startup patch, the engine writes the same bytes from the settings (and again on
+# every change in the menu). BB_HOT_EFFECTS=0: the patches at start, as before.
+HOT_EFFECTS={'effect_chromatic_aberration','effect_dof','effect_motion_blur','effect_ssao',
+             'effect_game_aa','effect_dynamic_shadows','effect_bloom'}
+# SSR also changes the size of a resource allocated by the renderer constructor
+# (0x22c428d). Applying only its shader/pass switches corrupts the scene; apply
+# the complete community patch before construction, and require a restart.
+
+
+def effect_patches(settings, env=os.environ):
     names=[]
+    hot=env.get('BB_HOT_EFFECTS','1')!='0'
     for key,(off,on) in EFFECTS.items():
         if key not in settings: continue
+        if hot and key in HOT_EFFECTS: continue
         name=on if settings[key]=='1' else off
         if name: names.append(name)
     # Enemy Control and the free camera use the same buttons: the free camera wins.
@@ -247,7 +355,9 @@ def eboot_bytes(elf,start,end):
 # resolution patches write, so another region's build with the same code passes. Recompute it
 # with --print-fingerprint (after a run of CUSA03173 v01.09) when those patches change.
 BUILTIN_XML=Path(__file__).resolve().parent.parent/'patches/Bloodborne.xml'
-FINGERPRINT_PATCHES=sorted({n for names in FPS_PRESETS.values() for n in names}|{RESOLUTION_TEMPLATE})
+# The FPS patches as of the stored fingerprint (the sprint fix that FPS_PRESETS gained later is
+# not part of it; adding it would change the fingerprint).
+FINGERPRINT_PATCHES=sorted({'60 FPS++','90 FPS++','Uncap FPS++',RESOLUTION_TEMPLATE})
 PATCH_FINGERPRINTS={'01.09':'34e41d1df9e3805762bfd59054e69fe60c330b9b6df7906fa7f66a43c939fbf0'}
 
 
@@ -310,8 +420,7 @@ def compile_patches(xml, names, app_version, segments):
 
 
 # Third-party patch files (shadPS4/GoldHEN XML) in the data directory's patches/ folder.
-# Every retail release with update 1.09 (the same executable): US, EU, UK, JP, Asia, then the
-# editions with The Old Hunters.
+# The retail releases (scripts/game_check.py SUPPORTED_TITLES): one 1.09 executable.
 BLOODBORNE_IDS={'CUSA00900','CUSA00207','CUSA00208','CUSA00299','CUSA01363',
                 'CUSA03179','CUSA03173','CUSA03014','CUSA03023'}
 
@@ -418,10 +527,16 @@ def main():
         print(f'Patches: eboot.bin is not the {a.app_version} build the patches were made for: none '
               'applied (30 FPS, no effect or resolution patches; BB_FORCE_PATCHES=1 applies them)')
         return
-    fps_names=FPS_PRESETS[a.fps]
+    fps_names=fps_patches(a.fps)
     names=fps_names+[n.strip() for n in a.extra.split(';') if n.strip()]
     names+=[n for n in effect_patches(read_settings(a.settings)) if n not in names]
-    validate_patch_requirements(names,a.game_dir)
+    if intel_tonemap_fix() and INTEL_TONEMAP not in names:
+        names.append(INTEL_TONEMAP)
+    if skip_network_choice() and SKIP_NETWORK_CHOICE not in names:
+        names.append(SKIP_NETWORK_CHOICE)
+    if gx_command_heap() and GX_COMMAND_HEAP not in names:
+        names.append(GX_COMMAND_HEAP)
+    names=validate_patch_requirements(names,a.game_dir)
     segments=eboot_segments((a.out/'eboot.elf').read_bytes())
     writes=compile_patches(a.xml,names,a.app_version,segments)
     fps_count=len(compile_patches(a.xml,fps_names,a.app_version,segments))  # the first writes

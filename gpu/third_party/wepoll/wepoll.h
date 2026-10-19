@@ -89,11 +89,14 @@ enum {
 typedef void* HANDLE;
 typedef uintptr_t SOCKET;
 
+/* bbport: the Windows POSIX layer (gpu/platform/win32/include/bbport_signal.h) defines sigset_t. */
+#ifndef BBPORT_SIGSET_T
 #define _SIGSET_NWORDS (1024 / (8 * sizeof (size_t)))
 typedef struct
 {
 	size_t __val[_SIGSET_NWORDS];
 } sigset_t;
+#endif
 
 typedef union epoll_data {
 	void* ptr;

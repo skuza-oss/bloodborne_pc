@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 IFreemz (shadps4_dlss bridge), bbport contributors
 // SPDX-License-Identifier: MIT
 //
-// C interface between bbport and bbport_dlss.dll. The port contains no NVIDIA code: it loads the
-// bridge at run time when it is present (next to bb-probe.exe, with nvngx_dlss.dll) and keeps
-// its other upscalers when it is absent. Adapted from IFreemz/shadPS4-Bloodborne-DLSS-FSR.
+// C interface between bbport and the DLSS bridge (libbbport_dlss.so / bbport_dlss.dll). The port
+// contains no NVIDIA code: it loads the bridge at run time when it is present (next to bb-probe,
+// with NVIDIA's libnvidia-ngx-dlss.so.<version> / nvngx_dlss.dll, and nvngx_dlssg.dll for Frame
+// Generation) and keeps its other upscalers when it is absent. Adapted from IFreemz/shadPS4-Bloodborne-DLSS-FSR.
 
 #pragma once
 
@@ -86,7 +87,8 @@ typedef struct BbDlssgEvaluate {
 
 typedef struct BbDlssApi {
     uint32_t abi;
-    // UTF-16 paths: the directory with nvngx_dlss.dll, and a writable data directory.
+    // wchar_t paths (NGX's type): the directory with NVIDIA's DLSS library, and a writable data
+    // directory (UTF-16 on Windows).
     int32_t (*Configure)(const wchar_t* dll_directory, const wchar_t* data_directory,
                          BbDlssLogFn log);
     // Vulkan extensions NGX needs (DLSS and, when the GPU has it, Frame Generation). The arrays

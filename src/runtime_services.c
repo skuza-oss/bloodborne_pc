@@ -13,12 +13,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <SDL3/SDL.h>
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
 #include <arpa/inet.h>
-#endif
 
 #define USER_ID 1
 #define ORBIS_OK 0
@@ -79,11 +74,7 @@ static ABI int32_t system_param(int32_t id,int32_t *value) {
     case 1: *value=language(); break;           /* language (1 = English US, 8 = Russian) */
     case 2: *value=1; break;                    /* date format DD/MM/YYYY */
     case 3: *value=1; break;                    /* 24-hour clock */
-#ifdef _WIN32
-    case 4: *value=(int32_t)(compat_utc_offset(time(NULL))/60); break;
-#else
-    case 4: { time_t now=time(NULL); struct tm t; localtime_r(&now,&t); *value=(int32_t)(t.tm_gmtoff/60); break; }
-#endif
+    case 4: { time_t now=time(NULL); struct tm t; localtime_r(&now,&t); *value=(int32_t)(RUNTIME_TM_GMTOFF(t)/60); break; }
     case 5: *value=0; break;                    /* summer time */
     case 7: *value=0; break;                    /* parental level off */
     case 1000: *value=1; break;                 /* enter button = cross */
@@ -544,28 +535,7 @@ static const RuntimeExport exports[]={
     {"sceDiscMapIsRequestOnHDD",discmap_on_hdd}, {"sceDiscMap_8A828CAEE7EDD5E9",discmap_8a82},
     {"sceVoiceInit",ok_void}, {"sceVoiceEnd",ok_void},
 };
-/* Co-op (BB_ONLINE=1): network and PSN calls go to the shadNet libraries in bbgpu when they
- * implement them. Trophies, voice and the store/profile dialogs stay here. */
-static int online_symbol(const char *symbol) {
-    static const char *const online[]={"sceNet","sceNp","sceHttp","sceSsl"};
-    static const char *const local[]={"sceNpTrophy","sceNpCommerce","sceNpProfileDialog"};
-    int match=0;
-    for (size_t i=0;i<sizeof(online)/sizeof(*online);++i)
-        if (!strncmp(symbol,online[i],strlen(online[i]))) match=1;
-    for (size_t i=0;i<sizeof(local)/sizeof(*local);++i)
-        if (!strncmp(symbol,local[i],strlen(local[i]))) match=0;
-    return match;
-}
 uintptr_t runtime_services_resolve(const char *name) {
-    static int online=-1;
-    if (online<0) { const char *v=getenv("BB_ONLINE"); online=v && v[0]=='1'; }
-    if (online) {
-        const char *symbol=runtime_symbol(name);
-        if (symbol && online_symbol(symbol)) {
-            uintptr_t address=bbgpu_resolve(name);
-            if (address) return address;
-            printf("Co-op: %s has no online version; using the offline one\n",symbol);
-        }
-    }
-    return RUNTIME_LOOKUP(exports,name);
+    const uintptr_t online=runtime_net_resolve(name); /* BB_ONLINE=1: the online module first */
+    return online ? online : RUNTIME_LOOKUP(exports,name);
 }

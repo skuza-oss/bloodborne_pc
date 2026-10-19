@@ -25,7 +25,23 @@ static _Atomic size_t memory_calls;
 static struct { const void *data; uint64_t filesz, memsz; } tls_modules[TLS_MODULES];
 static _Thread_local unsigned char *tls_blocks[TLS_MODULES];
 static void *process_param;
-void runtime_set_procparam(void *param) { process_param=param; }
+void runtime_set_procparam(void *param) {
+    process_param=param;
+    /* bbport: the game's libc heap settings (SceProcParam +0x30: SceLibcParam; its +0x10.. pointers to
+     * the heap size, delayed and extended allocation flags, initial size). */
+    const uint64_t *p=(const uint64_t *)param;
+    if (!p || p[0]<0x38 || !p[6]) return;
+    const uint64_t *libc=(const uint64_t *)p[6];
+    printf("Runtime: libc param size %#llx, entries %u", (unsigned long long)libc[0], (unsigned)libc[1]);
+    static const char *names[]={"heap size","delayed alloc","extended alloc","initial size"};
+    for (int i=0;i<4 && (uint64_t)(2+i)*8<libc[0];++i) {
+        const void *field=(const void *)libc[2+i];
+        if (!field) { printf(", %s -",names[i]); continue; }
+        if (i==0 || i==3) printf(", %s %#llx",names[i],(unsigned long long)*(const uint64_t *)field);
+        else printf(", %s %u",names[i],*(const uint32_t *)field);
+    }
+    printf("\n");
+}
 static ABI void *guest_procparam(void) { return process_param; }
 static void **application_heap_api;
 static ABI void guest_set_heap_api(void **api) {
@@ -81,6 +97,9 @@ void runtime_report(void) {
     runtime_audio_report();
     runtime_pad_report();
     runtime_savedata_report();
+    runtime_compat_report();
+    runtime_ngs2_report();
+    runtime_toypad_report();
     runtime_file_report();
     printf("Runtime: memory operations=%zu\n", (size_t)memory_calls);
 }
@@ -161,13 +180,19 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
     exit(22);
 }
 static ABI void *guest_memset(void *dst, int value, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memset(dst, value, size);
+    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+    runtime_memory_prepare_cpu_write((uintptr_t)dst, size);
+    memset(dst, value, size); runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcpy(dst, src, size);
+    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+    runtime_memory_prepare_cpu_write((uintptr_t)dst, size);
+    memcpy(dst, src, size); runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memmove(dst, src, size);
+    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+    runtime_memory_prepare_cpu_write((uintptr_t)dst, size);
+    memmove(dst, src, size); runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
 static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcmp(a, b, size);
@@ -179,33 +204,38 @@ static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
     runtime_report();
     exit(status);
 }
+uintptr_t runtime_libc_base;
 uintptr_t runtime_resolve(const char *name, int is_data) {
     if (!(capabilities & 1)) return 0;
     if (is_data) {
         static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
-        if (!strcmp(name, "f7uOxY9mM1U#p#J")) return (uintptr_t)&stack_canary;
-        if (!strcmp(name, "ZT4ODD2Ts9o#libSceLibcInternal")) return (uintptr_t)&need_libc_internal;
+        if (runtime_nid_is(name, "f7uOxY9mM1U")) return (uintptr_t)&stack_canary;
+        if (runtime_nid_is(name, "ZT4ODD2Ts9o")) return (uintptr_t)&need_libc_internal;
+        /* The program's name (libc's error messages). */
+        static const char *progname = "eboot.bin";
+        const char *symbol = runtime_symbol(name);
+        if (symbol && !strcmp(symbol, "__progname")) return (uintptr_t)&progname;
         return 0;
     }
     /* Exact scoped imports for CUSA03173; the suffix identifies library/module. */
-    if (!strcmp(name, "bzQExy189ZI#q#q")) return (uintptr_t)init_env;
-    if (!strcmp(name, "8G2LB+A3rzg#q#q")) return (uintptr_t)guest_atexit;
-    if (!strcmp(name, "tsvEmnenz48#q#q")) return (uintptr_t)guest_cxa_atexit;
-    if (!strcmp(name, "uMei1W9uyNo#q#q")) return (uintptr_t)guest_libc_exit;
+    if (runtime_nid_is(name, "bzQExy189ZI")) return (uintptr_t)init_env;
+    if (runtime_nid_is(name, "8G2LB+A3rzg")) return (uintptr_t)guest_atexit;
+    if (runtime_nid_is(name, "tsvEmnenz48")) return (uintptr_t)guest_cxa_atexit;
+    if (runtime_nid_is(name, "uMei1W9uyNo")) return (uintptr_t)guest_libc_exit;
     /* Not imported by the current eboot, exposed for ABI tests/future use. */
-    if (!strcmp(name, "H2e8t5ScQGc#q#q")) return (uintptr_t)guest_finalize;
-    if (!strcmp(name, "3GPpjQdAMTw#q#q")) return (uintptr_t)guard_acquire;
-    if (!strcmp(name, "9rAeANT2tyE#q#q")) return (uintptr_t)guard_release;
-    if (!strcmp(name, "2emaaluWzUw#q#q")) return (uintptr_t)guard_abort;
-    if (!strcmp(name, "Ou3iL1abvng#p#J")) return (uintptr_t)stack_fail;
-    if (!strcmp(name, "8zTFvBIAIN8#q#q")) return (uintptr_t)guest_memset;
-    if (!strcmp(name, "Q3VBxCXhUHs#q#q")) return (uintptr_t)guest_memcpy;
-    if (!strcmp(name, "+P6FRGH4LfA#q#q")) return (uintptr_t)guest_memmove;
-    if (!strcmp(name, "DfivPArhucg#q#q")) return (uintptr_t)guest_memcmp;
-    if (!strcmp(name, "j4ViWNHEgww#q#q")) return (uintptr_t)guest_strlen;
-    if (!strcmp(name, "vNe1w4diLCs#p#J")) return (uintptr_t)guest_tls_get_addr;
-    if (!strcmp(name, "959qrazPIrg#p#J")) return (uintptr_t)guest_procparam;
-    if (!strcmp(name, "p5EcQeEeJAE#p#J")) return (uintptr_t)guest_set_heap_api;
+    if (runtime_nid_is(name, "H2e8t5ScQGc")) return (uintptr_t)guest_finalize;
+    if (runtime_nid_is(name, "3GPpjQdAMTw")) return (uintptr_t)guard_acquire;
+    if (runtime_nid_is(name, "9rAeANT2tyE")) return (uintptr_t)guard_release;
+    if (runtime_nid_is(name, "2emaaluWzUw")) return (uintptr_t)guard_abort;
+    if (runtime_nid_is(name, "Ou3iL1abvng")) return (uintptr_t)stack_fail;
+    if (runtime_nid_is(name, "8zTFvBIAIN8")) return (uintptr_t)guest_memset;
+    if (runtime_nid_is(name, "Q3VBxCXhUHs")) return (uintptr_t)guest_memcpy;
+    if (runtime_nid_is(name, "+P6FRGH4LfA")) return (uintptr_t)guest_memmove;
+    if (runtime_nid_is(name, "DfivPArhucg")) return (uintptr_t)guest_memcmp;
+    if (runtime_nid_is(name, "j4ViWNHEgww")) return (uintptr_t)guest_strlen;
+    if (runtime_nid_is(name, "vNe1w4diLCs")) return (uintptr_t)guest_tls_get_addr;
+    if (runtime_nid_is(name, "959qrazPIrg")) return (uintptr_t)guest_procparam;
+    if (runtime_nid_is(name, "p5EcQeEeJAE")) return (uintptr_t)guest_set_heap_api;
     uintptr_t mutex = runtime_mutex_resolve(name);
     if (mutex) return mutex;
     uintptr_t thread = runtime_thread_resolve(name);
@@ -236,15 +266,28 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (save) return save;
     uintptr_t file = runtime_file_resolve(name);
     if (file) return file;
+    uintptr_t toypad = runtime_toypad_resolve(name);
+    if (toypad) return toypad;
+    uintptr_t ngs2 = runtime_ngs2_resolve(name);
+    if (ngs2) return ngs2;
+    uintptr_t compat = runtime_compat_resolve(name);
+    if (compat) return compat;
     return bbgpu_resolve(name);
 }
 static const struct { const char *nid, *symbol; } import_names[]={
 #include "import_names.inc"
+#include "import_names_extra.inc"
 };
-/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
+/* Symbol name for an import (NID, with or without its library/module suffix), or NULL when it is
+ * not known. The NID alone decides: it is the hash of the symbol's name, whatever library a game
+ * imports it from. */
 const char *runtime_symbol(const char *nid) {
-    for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
-        if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
+    const size_t length=strcspn(nid,"#");
+    for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i) {
+        const char *entry=import_names[i].nid;
+        if (!strncmp(nid,entry,length) && (entry[length]=='#' || entry[length]==0))
+            return import_names[i].symbol;
+    }
     return NULL;
 }
 /* Same symbol name means same contract whether imported from libkernel or

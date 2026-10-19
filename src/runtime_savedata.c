@@ -120,10 +120,20 @@ static int valid_name(const char *name, size_t max) {
     for (size_t i=0;i<n;++i) if (name[i]=='/' || name[i]=='\\' || (name[i]=='.' && (i==0 || name[i-1]=='.'))) return 0;
     return 1;
 }
+/* A whole file replaced in one rename (a crash mid-write keeps the old one). */
+static int write_atomic(const char *path, const void *data, size_t size) {
+    char temp[760]; snprintf(temp,sizeof(temp),"%s.bbtmp",path);
+    FILE *f=fopen(temp,"wb");
+    if (!f) return -1;
+    int ok=fwrite(data,1,size,f)==size && !fflush(f) && !fsync(fileno(f));
+    ok=!fclose(f) && ok;
+    if (!ok || rename(temp,path)) { unlink(temp); return -1; }
+    return 0;
+}
 static void write_param(const char *meta, const Param *p) {
     char path[700]; snprintf(path,sizeof(path),"%s/param.bin",meta);
-    FILE *f=fopen(path,"wb");
-    if (f) { Param copy=*p; copy.mtime=time(NULL); fwrite(&copy,sizeof(copy),1,f); fclose(f); }
+    Param copy=*p; copy.mtime=time(NULL);
+    write_atomic(path,&copy,sizeof(copy));
 }
 static int read_param(const char *meta, Param *p) {
     char path[700]; snprintf(path,sizeof(path),"%s/param.bin",meta);
@@ -132,7 +142,7 @@ static int read_param(const char *meta, Param *p) {
     if (!f) return -1;
     size_t n=fread(p,sizeof(*p),1,f); fclose(f);
     struct stat st;
-    if (!stat(path,&st)) p->mtime=st.st_mtime;
+    if (!stat(path,&st)) p->mtime=st.st_mtim.tv_sec;
     return n==1 ? 0 : -1;
 }
 #ifdef _WIN32
@@ -178,7 +188,9 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     snprintf(point,sizeof(point),"/savedata%d",slot&15);
     memcpy(result->point.data,point,strlen(point)+1);
     result->status=exists ? 0 : 1; /* CREATED */
-    runtime_file_mount(result->point.data,host);
+    if (runtime_file_mount(result->point.data,host)) {
+        fprintf(stderr,"Runtime: save data '%s' could not be mounted: mount table full\n",dir->data);
+    }
     ++mounts_done;
     pthread_mutex_unlock(&lock);
     printf("Runtime: save data '%s' mounted at %s (%s%s)\n",dir->data,result->point.data,
@@ -244,9 +256,7 @@ static ABI int32_t save_icon(const MountPoint *point, const Icon *icon) {
     int32_t r=ERR_NOT_MOUNTED;
     if (slot>=0) {
         char path[700]; snprintf(path,sizeof(path),"%s/icon0.png",slots[slot].meta);
-        FILE *f=fopen(path,"wb");
-        r=f && fwrite(icon->buffer,1,icon->data_size,f)==icon->data_size ? 0 : ERR_INTERNAL;
-        if (f) fclose(f);
+        r=write_atomic(path,icon->buffer,icon->data_size) ? ERR_INTERNAL : 0;
     }
     pthread_mutex_unlock(&lock);
     return r;
@@ -365,4 +375,3 @@ static const RuntimeExport exports[]={
 };
 uintptr_t runtime_savedata_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_savedata_report(void) { printf("Runtime: save data mounts=%zu, memory writes=%zu\n",mounts_done,memory_writes); }
-

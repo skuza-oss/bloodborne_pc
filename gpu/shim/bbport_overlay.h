@@ -7,7 +7,7 @@
 
 #include <string>
 #include "common/types.h"
-#include "video_core/renderer_vulkan/vk_common.h"
+#include "vulkan/vk_common.h"
 
 union SDL_Event;
 struct SDL_Window;
@@ -28,18 +28,19 @@ void UpdateTextInput(SDL_Window* window);
 
 /// Whether anything is drawn this frame (menu open or FPS counter on).
 bool Visible();
+/// A line of text over the game until called with null (bbgpu_overlay_banner).
+void SetBanner(const char* text);
 
 /// Present thread: draws into `view` (layout ColorAttachmentOptimal).
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
-/// Every presented image, generated frames included (FPS readout; BB_FPS_LOG=1 prints the rate
-/// every 5 seconds).
-void NotePresent();
 
-/// The menu is open or a text entry is shown: the game's input is held neutral.
+/// The menu or the text dialog is open: the game's input is held neutral.
 bool CapturesInput();
 
-/// Window thread: the game's text dialog (sceImeDialog). Shown as a box on screen until
-/// `active` is false; typing goes to the window (sdl_window), the box only displays it.
-void SetTextEntry(bool active, const std::string& prompt, const std::string& text);
+/// The settings menu is open: the window shows the system cursor over it.
+bool MenuOpen();
+
+/// Window thread: the game's text dialog (ImeDialog) state, drawn as a box over the frame.
+void SetTextPrompt(bool active, const std::string& prompt, const std::string& text);
 
 } // namespace BbOverlay

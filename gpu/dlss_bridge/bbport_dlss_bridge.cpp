@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 IFreemz (shadps4_dlss bridge), bbport contributors
 // SPDX-License-Identifier: MIT
 //
-// bbport_dlss.dll: the only part of the project that uses the NVIDIA DLSS (NGX) SDK. Built with
-// MSVC (the SDK's libraries are MSVC only); the port loads it at run time.
+// libbbport_dlss.so / bbport_dlss.dll: the only part of the project that uses the NVIDIA DLSS
+// (NGX) SDK; the port loads it at run time. Linux: build.sh with DLSS_SDK_ROOT; Windows: MSVC
+// (the SDK's Windows libraries are MSVC only), see CMakeLists.txt and
+// packaging/windows/build_dlss.sh.
 // Adapted from IFreemz/shadPS4-Bloodborne-DLSS-FSR (dlss_bridge).
 
 #include <algorithm>
@@ -24,7 +26,11 @@
 namespace {
 
 constexpr char ProjectId[] = "42359704-c9f3-4806-9fb5-d469000fdb8a";
+#ifdef _WIN32
 constexpr char EngineVersion[] = "bbport-windows";
+#else
+constexpr char EngineVersion[] = "bbport-linux";
+#endif
 
 struct State {
     BbDlssLogFn log{};
@@ -55,9 +61,13 @@ template <typename... Args>
 void Log(int warning, const char* format, Args... args) {
     if (!state.log)
         return;
-    std::array<char, 1024> text{};
-    std::snprintf(text.data(), text.size(), format, args...);
-    state.log(warning, text.data());
+    if constexpr (sizeof...(Args) == 0) {
+        state.log(warning, format); // a plain message (no format string without arguments)
+    } else {
+        std::array<char, 1024> text{};
+        std::snprintf(text.data(), text.size(), format, args...);
+        state.log(warning, text.data());
+    }
 }
 
 bool Check(const char* operation, NVSDK_NGX_Result result) {
@@ -456,6 +466,12 @@ const BbDlssApi api{BBPORT_DLSS_BRIDGE_ABI, Configure,        InstanceExtensions
 
 } // namespace
 
-extern "C" __declspec(dllexport) const BbDlssApi* BbDlssGetApi() {
+#ifdef _WIN32
+#define BBPORT_DLSS_EXPORT __declspec(dllexport)
+#else
+#define BBPORT_DLSS_EXPORT __attribute__((visibility("default")))
+#endif
+
+extern "C" BBPORT_DLSS_EXPORT const BbDlssApi* BbDlssGetApi() {
     return &api;
 }

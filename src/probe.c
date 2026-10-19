@@ -11,19 +11,21 @@
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
 #endif
-#ifdef _WIN32
-#include <windows.h>
-#else
 #include <sys/mman.h>
-#include <malloc.h>
 #include <unistd.h>
 #include <signal.h>
 #include <ucontext.h>
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <pthread.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#ifdef _WIN32
+#include <process.h>
+#include <windows.h>
+#else
+#include <malloc.h>
 #endif
 
 typedef struct { uint64_t address, size, flags; } Segment;
@@ -40,6 +42,55 @@ static int gpu_enabled;
 int vulkan_smoke(void);
 
 static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
+
+/* The game's code was compiled for the PS4's CPU (AMD Jaguar) and runs as it is: AVX, BMI1
+ * (andn/bextr/blsr/tzcnt), MOVBE, LZCNT and POPCNT, thousands of each in eboot.bin. A CPU without
+ * them stops at the first one with SIGILL (exit code 132, issue #26), and lzcnt/tzcnt even run as
+ * bsr/bsf there, with other results. Said before the game starts; BB_SKIP_CPU_CHECK=1 skips it. */
+static void check_cpu(void) {
+    const char *skip = getenv("BB_SKIP_CPU_CHECK");
+    if (skip && !strcmp(skip, "1")) return;
+    unsigned a, b, c, d, leaf1_c = 0, leaf7_b = 0, ext1_c = 0;
+    if (__get_cpuid(1, &a, &b, &c, &d)) leaf1_c = c;
+    if (__get_cpuid_count(7, 0, &a, &b, &c, &d)) leaf7_b = b;
+    if (__get_cpuid(0x80000001u, &a, &b, &c, &d)) ext1_c = c;
+    int avx = (leaf1_c & bit_AVX) && (leaf1_c & bit_OSXSAVE);
+    if (avx) {
+        unsigned lo, hi;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        avx = (lo & 6) == 6; /* the OS saves SSE and AVX state */
+    }
+    /* BB_CPU_COMPAT (run.py, Legacy CPU profile: scripts/cpu_compat.py translated BMI1, LZCNT and
+     * MOVBE in the linked image): only the others stop the game then. */
+    const int translated = getenv("BB_CPU_COMPAT") != NULL;
+    const struct { int present, translatable; const char *name; } features[] = {
+        {avx, 0, "AVX"}, {(leaf7_b & bit_BMI) != 0, 1, "BMI1"}, {(leaf1_c & bit_MOVBE) != 0, 1, "MOVBE"},
+        {(ext1_c & bit_LZCNT) != 0, 1, "LZCNT"}, {(leaf1_c & bit_POPCNT) != 0, 0, "POPCNT"},
+        {(leaf1_c & bit_SSE4_2) != 0, 0, "SSE4.2"},
+    };
+    char missing[64] = "", translations[64] = "";
+    for (unsigned i = 0; i < sizeof(features) / sizeof(features[0]); ++i) {
+        if (features[i].present) continue;
+        char *list = translated && features[i].translatable ? translations : missing;
+        if (list[0]) strcat(list, ", ");
+        strcat(list, features[i].name);
+    }
+    if (translations[0]) printf("CPU: no %s; the Legacy CPU translations run instead (best effort)\n", translations);
+    if (!missing[0]) return;
+    fprintf(stderr,
+            "ERROR: this CPU lacks %s. Bloodborne's code was compiled for the PS4's CPU and uses "
+            "these instructions directly: it needs an Intel Haswell (4th generation Core, 2013) or "
+            "newer, or an AMD Ryzen. BB_SKIP_CPU_CHECK=1 starts anyway.\n", missing);
+#ifdef _WIN32
+    /* Started from the launcher or Explorer: no console shows the message. */
+    char text[512];
+    snprintf(text, sizeof(text), "This processor cannot run the game.\n\nMissing instructions: %s\n\n"
+             "The game uses instructions of the PS4's processor. They need an Intel Core of the 4th "
+             "generation (Haswell, 2013) or newer, or an AMD Ryzen.", missing);
+    MessageBoxA(NULL, text, "Bloodborne", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+#endif
+    exit(1);
+}
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
     if (fread(b, 1, 8, f) != 8) fail("truncated boot file");
@@ -98,173 +149,34 @@ __asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
         " mov %rbp,%rsp\n pop %rbp\n ret\n");
 #endif
 static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
-/* The game is built for the PS4's AMD Jaguar CPU: AVX throughout, and BMI1 (andn, bextr, blsi, blsr,
- * tzcnt), MOVBE, LZCNT and POPCNT in thousands of places, its libc's string functions among them.
- * Without them it stopped at the first one with an illegal instruction (0xc000001d in libc.prx
- * while module 0 initialized), except LZCNT, which older Intel CPUs run as BSR (other results).
- * Exit code 24 with a message instead; BB_SKIP_CPU_CHECK=1 starts anyway. The Legacy CPU profile
- * (scripts/cpu_compat.py; run.py sets BB_CPU_COMPAT=1) translates BMI1, LZCNT and MOVBE in the
- * linked image, so only the others stop the game then. */
-static void check_cpu(void) {
-    if (getenv("BB_SKIP_CPU_CHECK")) return;
-    const int translated=getenv("BB_CPU_COMPAT")!=NULL;
-    unsigned a=0, b=0, c=0, d=0, basic=0, leaf7=0, extended=0;
-    if (__get_cpuid(1,&a,&b,&c,&d)) basic=c;
-    if (__get_cpuid_max(0,NULL)>=7) { __cpuid_count(7,0,a,b,c,d); leaf7=b; }
-    if (__get_cpuid(0x80000001,&a,&b,&c,&d)) extended=c;
-    int avx=0;
-    if (((basic>>27)&1) && ((basic>>28)&1)) { /* OSXSAVE and AVX: the OS also has to save YMM state */
-        unsigned low, high;
-        __asm__ volatile("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
-        avx=(low&6)==6;
-    }
-    const struct { int present, translatable; const char *name; } features[]={
-        {avx,0,"AVX"}, {(leaf7>>3)&1,1,"BMI1"}, {(basic>>22)&1,1,"MOVBE"}, {(extended>>5)&1,1,"LZCNT"},
-        {(basic>>23)&1,0,"POPCNT"}, {(basic>>20)&1,0,"SSE4.2"},
-    };
-    char missing[64]="", translations[64]="";
-    for (size_t i=0;i<sizeof(features)/sizeof(*features);++i) {
-        if (features[i].present) continue;
-        char *list=translated && features[i].translatable ? translations : missing;
-        if (*list) strcat(list,", ");
-        strcat(list,features[i].name);
-    }
-    if (*translations) printf("CPU: no %s; the Legacy CPU translations run instead (best effort)\n",translations);
-    if (!*missing) return;
-    unsigned words[12]={0};
-    char brand[49]="";
-    if (__get_cpuid_max(0x80000000,NULL)>=0x80000004)
-        for (unsigned i=0;i<3;++i) __get_cpuid(0x80000002+i,&words[i*4],&words[i*4+1],&words[i*4+2],&words[i*4+3]);
-    memcpy(brand,words,48);
-    for (size_t n=strlen(brand); n && brand[n-1]==' '; --n) brand[n-1]=0;
-    const char *name=brand;
-    while (*name==' ') ++name;
-    if (!*name) name="unknown processor";
-    fprintf(stderr,"STOP: unsupported CPU %s: missing %s (needs Intel Core 4th generation or newer, or AMD Ryzen)\n",name,missing);
 #ifdef _WIN32
-    char text[512];
-    snprintf(text,sizeof(text),"This processor cannot run the game:\n%s\n\nMissing instructions: %s\n\n"
-             "The game uses instructions of the PS4's processor. They need an Intel Core of the 4th "
-             "generation (Haswell, 2013) or newer, or an AMD Ryzen.",name,missing);
-    MessageBoxA(NULL,text,"Bloodborne",MB_OK|MB_ICONERROR|MB_SETFOREGROUND);
-#endif
-    exit(24);
+/* The game's entry on the main thread's low stack (bb_run_on_stack). */
+static void enter_game(void *p) {
+    struct { void *entry, *params; } *start=p;
+    typedef void (ABI *Entry)(void *, void (ABI *)(void));
+    ((Entry)start->entry)(start->params, guest_exit);
 }
-#ifdef _WIN32
-static void describe_address(char *out, size_t size, uintptr_t address) {
-    HMODULE module=NULL;
-    char name[MAX_PATH]="?";
-    if (image && address-(uintptr_t)image<0x20000000) { snprintf(out,size,"guest offset 0x%" PRIxPTR,address-(uintptr_t)image); return; }
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)address,&module) && module) {
-        GetModuleFileNameA(module,name,sizeof(name));
-        const char *base=strrchr(name,'\\');
-        snprintf(out,size,"%s+0x%" PRIxPTR,base ? base+1 : name,address-(uintptr_t)module);
-        return;
-    }
-    snprintf(out,size,"%p",(void *)address);
-}
-static int fatal_reported;
-static LONG fatal_exception(EXCEPTION_POINTERS *info) {
-    if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
-    const EXCEPTION_RECORD *record=info->ExceptionRecord;
-    const CONTEXT *c=info->ContextRecord;
-    char where[MAX_PATH+64];
-    describe_address(where,sizeof(where),(uintptr_t)c->Rip);
-    if (record->ExceptionCode==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2)
-        fprintf(stderr,"Fault: %s access to %p at %s (thread %lu)\n",
-                record->ExceptionInformation[0]==1 ? "write" : record->ExceptionInformation[0]==8 ? "execute" : "read",
-                (void *)record->ExceptionInformation[1],where,GetCurrentThreadId());
-    else
-        fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
-    fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
-            c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
-    if (gpu_enabled) bbgpu_dump_guest_writes(info);
-    /* Return addresses near the top of the stack: system libraries (the C runtime's memcpy)
-     * keep no frame pointers, so the rbp chain below can skip their caller. */
-    for (int slot=0, shown=0; slot<64 && shown<6; ++slot) {
-        uintptr_t value=0;
-        SIZE_T got=0;
-        if (!ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(c->Rsp+slot*8),&value,sizeof(value),&got) || got!=sizeof(value)) break;
-        HMODULE owner=NULL;
-        int code_ref=(image && value-(uintptr_t)image<0x20000000) ||
-                     (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)value,&owner) && owner==GetModuleHandleA(NULL));
-        if (!code_ref) continue;
-        describe_address(where,sizeof(where),value);
-        fprintf(stderr,"  [rsp+0x%x] %s\n",slot*8,where);
-        ++shown;
-    }
-    /* rbp chain (guest and host code keep frame pointers). */
-    uintptr_t rbp=(uintptr_t)c->Rbp;
-    for (int depth=0; depth<24 && rbp; ++depth) {
-        uintptr_t frame[2];
-        SIZE_T got=0;
-        if (!ReadProcessMemory(GetCurrentProcess(),(void *)rbp,frame,sizeof(frame),&got) || got!=sizeof(frame) || frame[0]<=rbp) break;
-        describe_address(where,sizeof(where),frame[1]);
-        fprintf(stderr,"  #%d %s\n",depth,where);
-        rbp=frame[0];
-    }
-    fflush(NULL);
-    TerminateProcess(GetCurrentProcess(),3);
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
-    const EXCEPTION_RECORD *record=info->ExceptionRecord;
-    DWORD code=record->ExceptionCode;
-    if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
-        /* GPU page tracking (write-protected guest pages) is resolved first. */
-        if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
-        if (runtime_fault_recover) {
-            /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
-             * in bb_longjmp, outside the exception dispatcher, back at its recovery point. */
-            unsigned long long *buffer=*runtime_fault_recover;
-            runtime_fault_recover=NULL;
-            CONTEXT *c=info->ContextRecord;
-            c->Rsp=((c->Rsp-128)&~(DWORD64)15)-40;
-            c->Rcx=(DWORD64)(uintptr_t)buffer;
-            c->Rdx=1;
-            c->Rip=(DWORD64)(uintptr_t)bb_longjmp;
-            return EXCEPTION_CONTINUE_EXECUTION;
+/* The linker rewrote the game's `mov r64, fs:[0]` (its thread pointer) to `mov r64, gs:[0]`
+ * (link_modules.py). GS is the TEB on Windows: the load reads a TEB TLS slot instead
+ * (gs:[0x1480 + 8 * slot], TlsSlots), where each guest thread keeps its TCB (runtime_thread.c). */
+static void patch_guest_tls(const Segment *segments, uint64_t ns) {
+    const uint32_t slot_offset=0x1480u+8u*(uint32_t)bb_guest_tls_slot();
+    uint64_t patched=0;
+    for (uint64_t i=0;i<ns;++i) {
+        if (!(segments[i].flags&1) || segments[i].size<9) continue;
+        unsigned char *p=image+segments[i].address, *end=p+segments[i].size-9;
+        for (; p<=end; ++p) {
+            if (p[0]!=0x65 || (p[1]!=0x48 && p[1]!=0x4c) || p[2]!=0x8b || (p[3]&0xc7)!=0x04 || p[4]!=0x25 ||
+                p[5] || p[6] || p[7] || p[8]) continue;
+            const uint64_t at=(uint64_t)(p-image), first=at&~(uint64_t)(page_size-1);
+            protect(image+first,round_page(at+9)-first,7); /* hooks may have left it read-only */
+            memcpy(p+5,&slot_offset,4);
+            ++patched;
         }
     }
-    if (code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_ILLEGAL_INSTRUCTION || code==EXCEPTION_PRIV_INSTRUCTION ||
-        code==EXCEPTION_STACK_OVERFLOW || code==EXCEPTION_INT_DIVIDE_BY_ZERO || code==EXCEPTION_DATATYPE_MISALIGNMENT) {
-        /* Faults in guest code, the loader or the runtime end the process with a report; drivers
-         * and system libraries may handle their own exceptions. */
-        uintptr_t rip=(uintptr_t)info->ContextRecord->Rip;
-        HMODULE self=GetModuleHandleA(NULL), module=NULL;
-        int ours=(image && rip-(uintptr_t)image<0x20000000) ||
-                 (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&module) && module==self) ||
-                 !module;
-        /* bbport: the C runtime handles none of its own faults (a bad pointer to memcpy or
-         * free from the port or the game): reported with the call chain into them, instead of
-         * Windows ending the process without a word (crashes after 1-2 hours in ucrtbase.dll). */
-        if (!ours && module && (module==GetModuleHandleA("ucrtbase.dll") || module==GetModuleHandleA("msvcrt.dll") ||
-                                module==GetModuleHandleA("vcruntime140.dll")))
-            ours=1;
-        if (ours) return fatal_exception(info);
-    }
-    /* BB_STRICT_HANDLES=1: a closed or invalid handle used anywhere is reported (diagnostics). */
-    if (code==0xC0000008 /* STATUS_INVALID_HANDLE */) return fatal_exception(info);
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
-/* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
- * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
-uint32_t runtime_thread_tcb_offset(void);
-static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
-    static const unsigned char load[]={0x65,0x48,0x8b,0x04,0x25,0,0,0,0};
-    uint32_t displacement=runtime_thread_tcb_offset();
-    uint64_t patched=0;
-    for (uint64_t s=0;s<count;++s) {
-        if (!(segments[s].flags&1) || segments[s].size<sizeof(load)) continue;
-        unsigned char *at=image+segments[s].address, *end=at+segments[s].size-sizeof(load);
-        for (; at<=end; ++at)
-            if (at[0]==0x65 && !memcmp(at,load,sizeof(load))) { memcpy(at+5,&displacement,4); ++patched; at+=sizeof(load)-1; }
-    }
-    return patched;
+    printf("Runtime: %" PRIu64 " guest thread pointer loads read TEB TLS slot %d\n",patched,bb_guest_tls_slot());
 }
 #endif
-#ifndef _WIN32
 static void fault(int sig, siginfo_t *info, void *context) {
     /* GPU page tracking (write-protected guest pages) is resolved first. */
     if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
@@ -292,7 +204,47 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    /* A guest fault: its thread and the game's call chain (return addresses along rbp, read with
+     * process_vm_readv so a broken chain cannot fault again). */
+    if (rip - (uintptr_t)image < 0x10000000) {
+        char thread[32] = "?";
+        pthread_getname_np(pthread_self(), thread, sizeof(thread));
+        int at = snprintf(line, sizeof(line), "  thread %s; calls:", thread);
+        uintptr_t rbp = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+        for (int i = 0; i < 12 && rbp && at < (int)sizeof(line) - 24; ++i) {
+            uintptr_t frame[2] = {0, 0};
+            struct iovec local = {frame, sizeof(frame)}, remote = {(void *)rbp, sizeof(frame)};
+            if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)sizeof(frame)) break;
+            if (frame[1] - (uintptr_t)image >= 0x10000000) break;
+            at += snprintf(line + at, sizeof(line) - at, " +0x%lx", (unsigned long)(frame[1] - (uintptr_t)image));
+            if (frame[0] <= rbp) break;
+            rbp = frame[0];
+        }
+        snprintf(line + at, sizeof(line) - at, "\n");
+        { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    }
+    { void runtime_re_watch_report(void); runtime_re_watch_report(); }
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
+    /* Outside the image and any shared object (generated code, a freed mapping): the mapping
+     * from /proc/self/maps, and the thread. */
+    if (rip - (uintptr_t)image >= 0x10000000 && !(dladdr((void *)rip, &where) && where.dli_fname)) {
+        char thread[32] = "?";
+        pthread_getname_np(pthread_self(), thread, sizeof(thread));
+        snprintf(line, sizeof(line), "  thread %s; mapping of RIP: ", thread);
+        { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+        FILE *maps = fopen("/proc/self/maps", "r");
+        int found = 0;
+        while (maps && fgets(line, sizeof(line), maps)) {
+            unsigned long from, to;
+            if (sscanf(line, "%lx-%lx", &from, &to) == 2 && rip >= from && rip < to) {
+                ssize_t written_=write(2, line, strlen(line)); (void)written_;
+                found = 1;
+                break;
+            }
+        }
+        if (maps) fclose(maps);
+        if (!found) { ssize_t written_=write(2, "none\n", 5); (void)written_; }
+    }
     /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
     int depth = backtrace(frames, 32);
@@ -306,11 +258,10 @@ static void fault(int sig, siginfo_t *info, void *context) {
     }
     _exit(128 + sig);
 }
-#endif
+static uintptr_t exe_base;
 #ifndef _WIN32
 /* Watchdog: dump RIP and the rbp frame chain of every thread (guest offsets
  * when inside the image). Reads use process_vm_readv so bad frames cannot fault. */
-static uintptr_t exe_base;
 static void write_hex(char *out, uint64_t v) {
     const char digits[] = "0123456789abcdef";
     for (int i = 0; i < 16; ++i) out[i] = digits[(v >> (60 - i * 4)) & 15];
@@ -323,6 +274,50 @@ static void dump_frames(ucontext_t *uc) {
     char arg[]="  tid=0000000000000000 rdi=0000000000000000\n";
     write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
     { ssize_t written_=write(2,arg,sizeof(arg)-1); (void)written_; }
+    /* All the registers and the top of the stack: what a thread waits for (a lock, a job, an event)
+     * is in them; the hang of a game thread is read from here afterwards. */
+    {
+        static const struct { const char *name; int reg; } regs[]={
+            {"rax",REG_RAX},{"rbx",REG_RBX},{"rcx",REG_RCX},{"rdx",REG_RDX},{"rsi",REG_RSI},{"rdi",REG_RDI},
+            {"rbp",REG_RBP},{"rsp",REG_RSP},{"r8",REG_R8},{"r9",REG_R9},{"r10",REG_R10},{"r11",REG_R11},
+            {"r12",REG_R12},{"r13",REG_R13},{"r14",REG_R14},{"r15",REG_R15},
+        };
+        for (size_t i=0;i<sizeof(regs)/sizeof(*regs);++i) {
+            char r[]="  tid=0000000000000000 NNN=0000000000000000\n";
+            write_hex(r+6,tid);
+            r[23]=regs[i].name[0]; r[24]=regs[i].name[1]; r[25]=regs[i].name[2] ? regs[i].name[2] : ' ';
+            write_hex(r+27,(uint64_t)uc->uc_mcontext.gregs[regs[i].reg]);
+            { ssize_t written_=write(2,r,sizeof(r)-1); (void)written_; }
+        }
+        /* What the pointer registers point at (guest addresses only): the 8 qwords there, so the
+         * object a thread waits on can be read from the log. */
+        static const int pointer_regs[]={REG_RDI,REG_RSI,REG_RBX,REG_R12,REG_R13,REG_R14,REG_R15,REG_RCX,REG_RDX};
+        for (size_t i=0;i<sizeof(pointer_regs)/sizeof(*pointer_regs);++i) {
+            const uintptr_t p=(uintptr_t)uc->uc_mcontext.gregs[pointer_regs[i]];
+            if (p<0x800000000ull || p>=0x1200000000ull) continue;
+            uint64_t words[8];
+            struct iovec local={words,sizeof(words)}, remote={(void *)p,sizeof(words)};
+            if (process_vm_readv(getpid(),&local,1,&remote,1,0)!=(ssize_t)sizeof(words)) continue;
+            for (int k=0;k<8;++k) {
+                char m[]="  tid=0000000000000000 at 0000000000000000+00=0000000000000000\n";
+                write_hex(m+6,tid); write_hex(m+26,p);
+                m[43]=(char)('0'+(k*8)/10%10); m[44]=(char)('0'+(k*8)%10);
+                write_hex(m+46,words[k]);
+                { ssize_t written_=write(2,m,sizeof(m)-1); (void)written_; }
+            }
+        }
+        uintptr_t sp=(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+        for (int i=0;i<24;++i) {
+            uint64_t word=0;
+            struct iovec local={&word,sizeof(word)}, remote={(void *)(sp+8*(uintptr_t)i),sizeof(word)};
+            if (process_vm_readv(getpid(),&local,1,&remote,1,0)!=(ssize_t)sizeof(word)) break;
+            char w[]="  tid=0000000000000000 stack+000=0000000000000000\n";
+            write_hex(w+6,tid);
+            w[29]=(char)('0'+(i*8)/100%10); w[30]=(char)('0'+(i*8)/10%10); w[31]=(char)('0'+(i*8)%10);
+            write_hex(w+33,word);
+            { ssize_t written_=write(2,w,sizeof(w)-1); (void)written_; }
+        }
+    }
     for (int depth=0; depth<24; ++depth) {
         write_hex(line+6,tid); write_hex(line+27,rip); write_hex(line+59,rip-(uintptr_t)image); write_hex(line+90,rip-exe_base);
         { ssize_t written_=write(2,line,sizeof(line)-1); (void)written_; }
@@ -405,6 +400,12 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
             if (value<base || !mapped(segments,ns,value-base,1)) fail("patch writes a pointer outside the image");
             slots[nslots++]=target;
         }
+        /* Hooks the GPU library installed before (at its start: bbport_guest_hooks) leave their
+           pages read-only and executable; the image gets its final protection after this. */
+        {
+            const uint64_t first=offset & ~(uint64_t)(page_size-1);
+            protect(image+first,(size_t)(round_page(offset+length)-first),7);
+        }
         memcpy(image+offset,data,length);
         for (size_t s=0;s<nslots;++s) {
             uint64_t value;
@@ -422,13 +423,26 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
 /* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
  * applied at start). Descriptors are closed first so the old GPU device and its memory are
  * released before the new process opens its own. */
+volatile int runtime_restarting;
 void runtime_restart(void) {
     fflush(NULL);
 #ifdef _WIN32
     /* run.py sets BB_RESTART_COMMAND: the launch command line, started again (new patches). */
     const char *command=getenv("BB_RESTART_COMMAND");
     puts("Runtime: restarting through run.py");
-    if (!command || !*command) { fputs("runtime_restart: BB_RESTART_COMMAND is not set\n",stderr); _exit(1); }
+    runtime_restarting=1; /* GPU threads failing from now on must not end the process first */
+    __sync_synchronize();
+    if (!command || !*command) {
+        /* Started without run.py: a new process with the same command line. */
+        STARTUPINFOW same={.cb=sizeof(same)};
+        PROCESS_INFORMATION child;
+        if (CreateProcessW(NULL,GetCommandLineW(),NULL,NULL,FALSE,0,NULL,NULL,&same,&child)) {
+            CloseHandle(child.hThread); CloseHandle(child.hProcess);
+        } else {
+            fprintf(stderr,"runtime_restart: CreateProcess failed (%lu)\n",GetLastError());
+        }
+        _exit(0);
+    }
     char *line=_strdup(command);
     /* Same output handles: a launcher reading the game's log keeps reading the new launch. */
     STARTUPINFOA startup={.cb=sizeof(startup),.dwFlags=STARTF_USESTDHANDLES,
@@ -443,6 +457,10 @@ void runtime_restart(void) {
     TerminateProcess(GetCurrentProcess(),0);
 #else
     puts("Runtime: restarting through run.sh");
+    /* The GPU threads still run until exec: their Vulkan calls fail once the device fd is
+     * closed below, and an assertion there must not end the process (exit 23) before exec. */
+    runtime_restarting = 1;
+    __sync_synchronize();
     syscall(SYS_close_range, 3u, ~0u, 0u);
     execlp("bash", "bash", "run.sh", (char *)NULL);
     perror("runtime_restart: exec");
@@ -460,12 +478,7 @@ int main(int argc, char **argv) {
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     check_cpu();
-#ifdef _WIN32
-    /* The PS4 user range must stay free of host allocations (GPU driver, heaps), and the guest
-     * TCB needs one of the 64 TEB TLS slots before DLLs (Vulkan drivers) take them. */
     runtime_memory_reserve();
-    runtime_thread_tcb_offset();
-#endif
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
     const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL;
@@ -506,28 +519,21 @@ int main(int argc, char **argv) {
         sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
         sfo_value(sfo,"APP_VER",version,sizeof(version),NULL);
-        bbnet_configure(app0,serial,title,version);
+#ifdef _WIN32
+    /* bbport Windows: the guest TCB's TEB TLS slot (one of the 64 inline ones) is taken before
+     * DLLs (Vulkan drivers) can take them all. */
+    bb_guest_tls_slot();
+#endif
+        runtime_net_configure(app0,serial,title,version);
     }
     bbgpu_register_kernel();
-#ifdef _WIN32
-    SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
-    AddVectoredExceptionHandler(1, vectored_fault);
-    SetUnhandledExceptionFilter(unhandled_fault);
-    if (getenv("BB_STRICT_HANDLES")) {
-        PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
-        strict.RaiseExceptionOnInvalidHandleReference=1;
-        strict.HandleExceptionsPermanentlyEnabled=1;
-        if (!SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy,&strict,sizeof(strict)))
-            fprintf(stderr,"BB_STRICT_HANDLES: policy not set (%lu)\n",GetLastError());
-    }
-    (void)timeout_seconds; /* no watchdog on Windows */
-#else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
     Dl_info self_info;
     if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
+#ifndef _WIN32
     struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
     sigemptyset(&dump.sa_mask); sigaction(SIGUSR2, &dump, NULL);
     struct sigaction alarm_action = {0}; alarm_action.sa_sigaction = watchdog; alarm_action.sa_flags = SA_SIGINFO;
@@ -662,6 +668,11 @@ int main(int argc, char **argv) {
         t[8] = 0x48; t[9] = 0xb8; memcpy(t + 10, &handler, 8);
         t[18] = 0xff; t[19] = 0xe0;
     }
+    /* BB_LIST_UNRESOLVED=1 (porting another game): every import neither the runtime nor a
+     * native module provides, once each, before the game runs. */
+    const char *list_env = getenv("BB_LIST_UNRESOLVED");
+    unsigned char *listed = list_env && list_env[0] == '1' ? calloc(import_count + 1, 1) : NULL;
+    uint64_t unresolved_count = 0;
     for (uint64_t i = 0; i < nr; ++i) {
         uintptr_t value = relocs[i].kind == 2 ? (uintptr_t)(data_traps + page_size * relocs[i].value + relocs[i].addend)
                         : relocs[i].kind == 1 ? (uintptr_t)(traps + 32 * relocs[i].value)
@@ -673,15 +684,24 @@ int main(int argc, char **argv) {
                 uint64_t address=bindings[relocs[i].value];
                 if (binding_kinds[relocs[i].value]!=relocs[i].kind || !mapped(segments,ns,address,relocs[i].addend+1)) fail("native export kind/range mismatch");
                 value=(uintptr_t)image+address+relocs[i].addend;
+            } else if (listed && !listed[relocs[i].value]) {
+                listed[relocs[i].value] = 1;
+                ++unresolved_count;
+                printf("Unresolved import: %s%s\n", names[relocs[i].value],
+                       relocs[i].kind == 2 ? " (data)" : "");
             }
         }
         memcpy(image + relocs[i].target, &value, 8);
     }
-    /* The Hunter's Dream backend reads the game's code before the patches change it. */
-    bbnet_set_image(image, size);
+    if (listed) {
+        printf("Unresolved imports: %" PRIu64 "\n", unresolved_count);
+        free(listed);
+    }
+    runtime_net_image_mapped(image, size); /* online modules that read the original code */
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+    if (!cpu_only) bbgpu_patch_image(image, size);
 #ifdef _WIN32
-    printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
+    patch_guest_tls(segments, ns);
 #endif
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
@@ -693,6 +713,7 @@ int main(int argc, char **argv) {
     }
     if (!executable_entry) fail("entry is not executable");
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
+    runtime_net_image_ready((uintptr_t)image, size); /* online game modules (BBSC) hook it now */
     if (native_libc) {
         for (uint64_t m=0;m<module_count;++m) {
             int init_executable=0;
@@ -703,6 +724,7 @@ int main(int argc, char **argv) {
                 runtime_set_module_tls(modules[m].tls_module,image+modules[m].tls_address,modules[m].tls_filesz,modules[m].tls_memsz);
         }
         runtime_set_main_tls(image+main_tls[0],main_tls[1],main_tls[2],main_tls[3]);
+        if (module_count) runtime_libc_base=(uintptr_t)image+modules[0].base;
         runtime_thread_attach_main();
         runtime_set_procparam(image+procparam);
         /* Dependencies start in link order (libc first), as the PS4 dynamic linker does. */
@@ -714,13 +736,17 @@ int main(int argc, char **argv) {
             if (result) fail("module initializer failed");
         }
     }
-    bbnet_initialize(); /* the online session starts with the game */
+    runtime_net_start(); /* online sessions start with the game */
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
 #ifdef _WIN32
-    typedef void (ABI *Entry)(void *, void (ABI *)(void));
-    ((Entry)(image + entry))(&params, guest_exit);
+    enum { MAIN_STACK=8*1024*1024 };
+    unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
+    if (!stack) fail("cannot allocate guest main stack");
+    static struct { void *entry, *params; } start;
+    start.entry=image+entry; start.params=&params;
+    bb_run_on_stack(enter_game,&start,stack,stack+MAIN_STACK-64);
 #else
     /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
     enum { MAIN_STACK=8*1024*1024 };

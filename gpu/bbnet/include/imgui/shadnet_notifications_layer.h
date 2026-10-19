@@ -16,7 +16,6 @@ enum class Kind {
     FriendLost,
     Online,
     Info,
-    Warning, // the server refused something (e.g. matchmaking full)
 };
 
 // A retained notification entry

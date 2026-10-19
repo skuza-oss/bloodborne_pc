@@ -263,6 +263,11 @@
             <Line Type="bytes" Address="0x0269faa8" Value="c783ac000000000000009090"/>
         </PatchList>
     </Metadata>
+    <Metadata Title="Bloodborne" Name="Disable Bloom" Note="Disable Bloom, minor performance increase." Author="Kyo" PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x025D72F0" Value="31F60F1F4000"/>
+        </PatchList>
+    </Metadata>
     <Metadata Title="Bloodborne" Name="Disable AA" Note="Disables Anti-Aliasing constructor." Author="Kyo" PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="true">
         <PatchList>
             <Line Type="bytes" Address="0x026C254A" Value="00"/>
@@ -3444,6 +3449,22 @@
             <Line Type="bytes" Address="0x01de367d" Value="4183bc24c400000001" />
             <Line Type="bytes" Address="0x01de3686" Value="e934f3b8ff" />
             <Line Type="bytes" Address="0x01de368b" Value="c3" />
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="Sprint Fix (High FPS)" Note="Fixes sprint dropping to half speed above ~147 FPS (and at random moments above ~90 FPS). Use together with Uncap FPS++ or 90 FPS++. The game's wall detector measured distance per frame (a 30 FPS rule); this makes it measure speed instead." Author="yogesh1239" PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x01914c24" Value="c5fa5e458c0f1f00"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="Skip Online/Offline Choice" Author="bbport" Note="The title screen goes straight to the main menu in offline mode: the function that builds the PLAY ONLINE / PLAY OFFLINE dialog (0x1b39030) returns what its PLAY OFFLINE item returns (the item callback's operator() at 0x1b49cd0, item functor vtable 0x533be30), so the dialog is never shown. Used at start and after Quit Game. The port has no PSN." PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x01f39030" Value="554889e5534883ec184889fb488d05ed2d80034889042448897424084889e6e87c0c01004889d84883c4185b5dc3"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="Larger GX Per-Frame Command Heap" Author="bbport" Note="Each GX swap-chain command buffer gets a 1 MiB per-frame heap instead of 256 KiB, covering the unchecked NULL command allocations at guest 0x2199310 and 0x21d5b40 (#162, PR #224)." PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x02595c0a" Value="00001000"/>
+            <Line Type="bytes" Address="0x02595c47" Value="00001000"/>
         </PatchList>
     </Metadata>
     <Metadata Title="Bloodborne" Name="Live map (The Hunter's Dream)" Note="Uploads the play log every 5 s instead of 300 s and samples the position every 0.5 s instead of 1.5 s, as bbhost does, so the player shows on thehuntersdream.com's live map. Only with The Hunter's Dream co-op pool (bbbridge)." Author="bbbridge (from bbhost)" PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="false">

@@ -1,4 +1,4 @@
-/* C interface of the GPU library (gpu/): shadPS4's Liverpool/Vulkan video core,
+/* C interface of the GPU library (gpu/): the command processor and Vulkan renderer,
  * GnmDriver, VideoOut and kernel event queues, adapted to the native loader. */
 #ifndef BBGPU_H
 #define BBGPU_H
@@ -16,12 +16,6 @@ typedef struct {
 } BbGpuConfig;
 /* Registers kernel event queues (needed with or without graphics). */
 void bbgpu_register_kernel(void);
-/* Co-op: the game folder and param.sfo identity for the network and PSN libraries. */
-void bbnet_configure(const char *app0, const char *serial, const char *title, const char *app_ver);
-/* The game's code before the patches (The Hunter's Dream backend), then the online session's
- * start (bbnet/bbnet_glue.cpp). */
-void bbnet_set_image(unsigned char *image, uint64_t size);
-void bbnet_initialize(void);
 /* Creates window, Vulkan device, presenter and GPU command processor. */
 int bbgpu_init(const BbGpuConfig *config);
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
@@ -39,41 +33,45 @@ int bbgpu_overlay_captures_input(void);
 /* 1 while the game should be silent: bbport.ini mute_unfocused is on and the window does not
  * have focus. Safe from any thread (the audio ports read it for every buffer). */
 int bbgpu_audio_muted(void);
-/* Button prompts (gpu/shim/bbport_prompts.cpp): what each of the game's key-guide icons shows
- * on keyboard and mouse, one string per icon in bbport_prompt_icons.h's order ("e",
- * "lshift+leftbutton", "w a s d", "mouse", "" for nothing). Draws them; safe from any thread. */
-void bbgpu_prompts_configure(const char *const *inputs, int count);
-
-/* Mouse input accumulated by the window thread since the last call; the call resets the
- * motion (dx/dy) but not held buttons. All zero (and captured=0) while capture is inactive
- * (mouse_to_joystick absent or off, no window focus, menu or text entry open). buttons uses
- * SDL_BUTTON_MASK() bits (bit 0 = SDL_BUTTON_LEFT, ...), NOT the SDL_BUTTON_* index runtime_
- * input_config.c stores for a mouse_left/mouse_right/... binding -- convert with
- * SDL_BUTTON_MASK(value) before comparing. wheel bit 0 up, 1 down, 2 left, 3 right: a 33 ms
- * pulse per step (MOU-007), already decayed by the time this call sees it.
- * See specs/keyboard-and-mouse/spec-design-keyboard-mouse-input.md section 4.5 (API-002). */
-typedef struct {
-    float dx, dy;
-    uint32_t buttons;
-    uint32_t wheel;
-    int32_t captured;
-} BbMouseInput;
-void bbgpu_mouse_take(BbMouseInput *out);
-/* Applies a just-(re)loaded input.ini to the window thread: whether mouse-to-joystick mode
- * exists at all (mouse_mode_available; MOU-001), and the current toggle/reload hotkey
- * scancodes (SDL_SCANCODE_UNKNOWN = none bound; HOT-002). Safe from any thread; takes effect
- * on the window thread's next PollEvents. */
-void bbgpu_input_configure(int mouse_mode_available, int32_t toggle_scancode, int32_t reload_scancode);
-/* 1 once after the reload hotkey (default F8) was pressed, then clears back to 0 -- the pad
- * thread polls this once per sample() (CFG-008) to know when to re-read input.ini. 0 if no
- * window exists yet. */
-int bbgpu_input_reload_requested(void);
-/* Direct mouse camera (mouse_camera = direct in input.ini): whether it is wanted, its
- * sensitivity multiplier, and the motion's per-axis multipliers (input_mouse_scale_x/_y: -1 to
- * invert, the vertical sensitivity) and whether the drawn position turns too (mouse_camera_sync).
- * Safe from any thread; applied on the window thread's next
- * PollEvents. */
-void bbgpu_mouse_camera_configure(int direct, float sensitivity, float scale_x, float scale_y, int sync);
+/* Mouse look (runtime_pad.c): the window takes the mouse when it is clicked (relative mode) and
+ * lets it go on F1, losing focus or the menu opening. take: motion (pixels) and wheel notches
+ * since the last call, reset; captured: 1 while the window holds it; enable: mouse_look=0 in
+ * bbport.ini keeps the window from taking it. */
+void bbgpu_mouse_take(double *dx, double *dy, int *wheel_up, int *wheel_down);
+int bbgpu_mouse_captured(void);
+/* Asks the window to take the mouse (relative mode, as a click in the game does); the window
+ * thread does it. */
+void bbgpu_mouse_capture(void);
+void bbgpu_mouse_look_enable(int enabled);
+/* A module's look at the window's events first (an SDL_Event and the SDL_Window, on the window
+ * thread): nonzero takes the event (the port and the game do not see it). Up to 4. */
+typedef int (*BbGpuEventFilter)(const void *sdl_event, void *sdl_window);
+void bbgpu_add_event_filter(BbGpuEventFilter filter);
+/* A module's menu pointer: nonzero while the game shows a menu the mouse points into. The window
+ * then lets the mouse go and shows the cursor, and takes the mouse back after (as it had it).
+ * Up to 4; pointer_wanted: any of them says so. */
+typedef int (*BbGpuPointerQuery)(void);
+void bbgpu_add_pointer_query(BbGpuPointerQuery query);
+int bbgpu_pointer_wanted(void);
+/* A module's changes to the pad state the game reads (runtime_pad.c, after the host's input and
+ * the scripted one): the buttons (PS4 bits); the sticks (lx ly rx ry) as they are. Up to 4. */
+typedef void (*BbGpuPadFilter)(uint32_t *buttons, const uint8_t *sticks);
+void bbgpu_add_pad_filter(BbGpuPadFilter filter);
+void bbgpu_filter_pad(uint32_t *buttons, const uint8_t *sticks);
+/* The shown frame's width / height (the display buffer's; the window letterboxes it). */
+float bbgpu_frame_aspect(void);
+/* A line of text over the game, near the bottom, until called with NULL (any thread). */
+void bbgpu_overlay_banner(const char *utf8);
+/* Native mouse look: turns the game's camera (radians, applied at its next update); 0 when the
+ * camera hook is not in (another game version, BB_NATIVE_MOUSE=0) or the camera does not take the
+ * turns now (lock-on, menus): drive the right stick then. */
+int bbgpu_camera_look(float yaw, float pitch);
+/* 1 while the free camera (the community patch) is on: the mouse drives it through the right stick. */
+int bbgpu_free_camera(void);
+/* The game's current camera state (its projection parameters at +0x50), 0 until known. */
+uint64_t bbgpu_camera_state(void);
+/* Patches the loaded image before the game runs (image still writable): libGnm entry hooks. */
+void bbgpu_patch_image(unsigned char *image, uint64_t size);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
 #ifdef __cplusplus

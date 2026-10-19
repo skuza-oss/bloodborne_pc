@@ -1,43 +1,136 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
-#include <cmath>
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <array>
+#include "bbgpu.h"
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "sdl_window.h"
-#include "bbport_mouse.h"
+#include "bbport_cursor.h"
+#include "bbport_frame_rate.h"
 #include "bbport_overlay.h"
-#include "bbport_prompts.h"
-#include "bloodborne_cam.h"
+#include "bbport_settings.h"
 
-namespace Frontend {
 
-/// The buttons a controller has, for its prompts: SDL's type, by vendor and product.
-static BbPrompts::Device PadDevice(SDL_JoystickID id) {
-    switch (SDL_GetGamepadTypeForID(id)) {
-    case SDL_GAMEPAD_TYPE_PS3:
-    case SDL_GAMEPAD_TYPE_PS4:
-    case SDL_GAMEPAD_TYPE_PS5:
-        return BbPrompts::PlayStation;
-    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
-    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
-    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
-    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
-        return BbPrompts::Switch;
-    default:
-        return BbPrompts::Xbox; // Xbox, and the many controllers that copy its buttons
+namespace {
+std::array<std::atomic<BbGpuEventFilter>, 4> event_filters{};
+
+bool FilteredByModule(const SDL_Event* event, SDL_Window* window) {
+    for (const auto& slot : event_filters) {
+        const BbGpuEventFilter filter = slot.load(std::memory_order_acquire);
+        if (filter && filter(event, window)) {
+            return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+extern "C" void bbgpu_add_event_filter(BbGpuEventFilter filter) {
+    for (auto& slot : event_filters) {
+        BbGpuEventFilter expected = nullptr;
+        if (slot.compare_exchange_strong(expected, filter)) {
+            return;
+        }
     }
 }
 
 namespace {
-// MOU-007: each wheel step keeps its direction's bit set for 33 ms (shadPS4's pulse length,
-// ported so a config's mouse_movement_params tuning carries over); consecutive steps extend
-// it rather than stacking. One expiry timestamp per direction, window-thread only.
-constexpr uint32_t kWheelPulseMs = 33;
-std::array<uint64_t, 4> g_wheel_expiry_ms{}; // index: WHEEL_UP=0, DOWN=1, LEFT=2, RIGHT=3
+std::array<std::atomic<BbGpuPointerQuery>, 4> pointer_queries{};
+std::array<std::atomic<BbGpuPadFilter>, 4> pad_filters{};
+
+template <typename T>
+void AddTo(std::array<std::atomic<T>, 4>& slots, T value) {
+    for (auto& slot : slots) {
+        T expected = nullptr;
+        if (slot.compare_exchange_strong(expected, value)) {
+            return;
+        }
+    }
+}
+} // namespace
+
+extern "C" void bbgpu_add_pointer_query(BbGpuPointerQuery query) {
+    AddTo(pointer_queries, query);
+}
+
+extern "C" int bbgpu_pointer_wanted(void) {
+    for (const auto& slot : pointer_queries) {
+        const BbGpuPointerQuery query = slot.load(std::memory_order_acquire);
+        if (query && query()) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+extern "C" void bbgpu_add_pad_filter(BbGpuPadFilter filter) {
+    AddTo(pad_filters, filter);
+}
+
+extern "C" void bbgpu_filter_pad(uint32_t* buttons, const uint8_t* sticks) {
+    for (const auto& slot : pad_filters) {
+        if (const BbGpuPadFilter filter = slot.load(std::memory_order_acquire)) {
+            filter(buttons, sticks);
+        }
+    }
+}
+
+namespace Frontend {
+
+namespace {
+
+// Issue #69: the monitor the window (and fullscreen) goes to. BB_DISPLAY: its number in SDL's
+// order (1, 2, ...; bb-gpu-capabilities --displays lists them) or a part of its name; without it
+// SDL's primary display. The monitors are logged so a report says which one was taken.
+SDL_DisplayID ChooseDisplay() {
+    const SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+    const char* wanted = std::getenv("BB_DISPLAY");
+    int count = 0;
+    SDL_DisplayID* ids = SDL_GetDisplays(&count);
+    SDL_DisplayID chosen = 0;
+    if (wanted && *wanted) {
+        char* end = nullptr;
+        const long number = std::strtol(wanted, &end, 10);
+        if (end && *end == '\0') {
+            if (number >= 1 && number <= count) {
+                chosen = ids[number - 1];
+            }
+        } else {
+            for (int i = 0; i < count && !chosen; ++i) {
+                const char* name = SDL_GetDisplayName(ids[i]);
+                if (name && strcasestr(name, wanted)) {
+                    chosen = ids[i];
+                }
+            }
+        }
+    }
+    const SDL_DisplayID display = chosen ? chosen : primary;
+    for (int i = 0; i < count; ++i) {
+        const char* name = SDL_GetDisplayName(ids[i]);
+        const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(ids[i]);
+        std::printf("Display %d: %s %dx%d%s%s\n", i + 1, name ? name : "?", mode ? mode->w : 0,
+                    mode ? mode->h : 0, ids[i] == primary ? " (primary)" : "",
+                    ids[i] == display ? " <- the game's (BB_DISPLAY)" : "");
+    }
+    if (wanted && *wanted && !chosen) {
+        std::printf("Display: BB_DISPLAY=%s matches none, the primary one is used\n", wanted);
+    }
+    SDL_free(ids);
+    return display;
+}
+
+// The monitor the window is on, in pixels: the output's aspect ratio "Auto" follows it.
+void TellMonitor(SDL_Window* window) {
+    if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window))) {
+        const float density = mode->pixel_density > 0.0f ? mode->pixel_density : 1.0f;
+        BbSettings::SetMonitor(int(mode->w * density + 0.5f), int(mode->h * density + 0.5f));
+    }
+}
+
 } // namespace
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
@@ -47,8 +140,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    const SDL_DisplayID display = ChooseDisplay();
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display));
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
@@ -59,16 +153,18 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
+    // The cursor over the game: the port's own (BB_CURSOR=0: the system's).
+    if (SDL_Cursor* cursor = BbCursor::Create()) {
+        SDL_SetCursor(cursor);
+    }
 
     const char* driver = SDL_GetCurrentVideoDriver();
     const SDL_PropertiesID wp = SDL_GetWindowProperties(window);
-#ifdef _WIN32
     if (driver && !std::strcmp(driver, "windows")) {
         window_info.type = WindowSystemType::Windows;
+        window_info.display_connection = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, nullptr);
         window_info.render_surface = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
-    } else
-#endif
-    if (driver && !std::strcmp(driver, "x11")) {
+    } else if (driver && !std::strcmp(driver, "x11")) {
         window_info.type = WindowSystemType::X11;
         window_info.display_connection = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr);
         window_info.render_surface = reinterpret_cast<void*>(SDL_GetNumberProperty(wp, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0));
@@ -84,12 +180,10 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     width = w;
     height = h;
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
-    BbMouse::Start();
+    TellMonitor(window);
 }
 
 WindowSDL::~WindowSDL() {
-    BbMouse::Stop();
-    Core::BloodborneCam::Instance().Shutdown();
     SDL_DestroyWindow(window);
 }
 
@@ -107,11 +201,60 @@ int WindowSDL::PollTextInput(std::string& out) {
     return text_state;
 }
 
+void WindowSDL::TakeMouse(double& dx, double& dy, int& up, int& down) {
+    std::scoped_lock lock{mouse_mutex};
+    dx = mouse_dx;
+    dy = mouse_dy;
+    up = wheel_up;
+    down = wheel_down;
+    mouse_dx = mouse_dy = 0;
+    wheel_up = wheel_down = 0;
+}
+
+// Mouse look: relative mode while the window holds the mouse (runtime_pad.c turns its motion into
+// the right stick). Motion from before is dropped, so taking the mouse does not turn the camera.
+void WindowSDL::CaptureMouse(bool capture) {
+    if (capture == mouse_captured.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (!SDL_SetWindowRelativeMouseMode(window, capture) && capture) {
+        std::printf("Mouse look: relative mouse mode failed: %s\n", SDL_GetError());
+        return;
+    }
+    {
+        std::scoped_lock lock{mouse_mutex};
+        mouse_dx = mouse_dy = 0;
+        wheel_up = wheel_down = 0;
+    }
+    mouse_captured.store(capture, std::memory_order_relaxed);
+    if (capture) {
+        capture_settle_ms = SDL_GetTicks() + 100;
+    }
+    static bool told;
+    if (capture && !told) {
+        told = true;
+        std::printf("Mouse look: on (F1 releases the mouse, a click takes it again)\n");
+    }
+}
+
 void WindowSDL::UpdateTextTitle() {
     const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + text + "_  (Enter = OK, Esc = cancel)"
                                           : base_title;
     SDL_SetWindowTitle(window, title.c_str());
-    BbOverlay::SetTextEntry(text_active, text_prompt, text);
+    BbOverlay::SetTextPrompt(text_active, text_prompt, text);
+}
+
+// Mouse: the window holds the pointer (confined, and relative for looking) whenever it has focus, in
+// the game's menus and its pointer menus too (the mouse must not leave the window mid-game). F1 lets
+// it go (to use another window), a click or F1 again takes it back.
+static bool mouse_user_released = false;
+static bool mouse_grabbed = false;
+
+// bbport.ini mute_unfocused (bbgpu_audio_muted): whether the window has keyboard focus, for the
+// audio threads.
+static std::atomic<bool> window_has_focus{true};
+bool WindowHasFocus() {
+    return window_has_focus.load(std::memory_order_relaxed);
 }
 
 bool WindowSDL::PollEvents() {
@@ -127,87 +270,24 @@ bool WindowSDL::PollEvents() {
     if (!text_active) {
         BbOverlay::UpdateTextInput(window);
     }
+    // A game module's menu wants the mouse as a pointer (bbgpu_add_pointer_query).
+    const bool pointer = bbgpu_pointer_wanted() != 0;
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
-        // Button prompts follow the device that was used last: a key, a click, the wheel or a
-        // real mouse movement, or a controller button or a stick or trigger pushed past half.
-        switch (event.type) {
-        case SDL_EVENT_KEY_DOWN:
-            if (!event.key.repeat) BbPrompts::OnInput(BbPrompts::Keyboard);
-            break;
-        case SDL_EVENT_MOUSE_BUTTON_DOWN:
-        case SDL_EVENT_MOUSE_WHEEL:
-            BbPrompts::OnInput(BbPrompts::Keyboard);
-            break;
-        case SDL_EVENT_MOUSE_MOTION:
-            if (std::abs(event.motion.xrel) + std::abs(event.motion.yrel) >= 3.0f) {
-                BbPrompts::OnInput(BbPrompts::Keyboard);
-            }
-            break;
-        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-            BbPrompts::OnInput(PadDevice(event.gbutton.which));
-            break;
-        case SDL_EVENT_GAMEPAD_ADDED:
-            // The game starts with the controller's prompts.
-            std::printf("Prompts: controller %s: %s\n", SDL_GetGamepadNameForID(event.gdevice.which),
-                        SDL_GetGamepadStringForType(SDL_GetGamepadTypeForID(event.gdevice.which)));
-            BbPrompts::OnControllerConnected(PadDevice(event.gdevice.which));
-            break;
-        case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-            if (std::abs(int(event.gaxis.value)) > 16000) BbPrompts::OnInput(PadDevice(event.gaxis.which));
-            break;
-        default:
-            break;
+        if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED || event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+            window_has_focus.store(event.type == SDL_EVENT_WINDOW_FOCUS_GAINED,
+                                   std::memory_order_relaxed);
         }
-        // HOT-003: the toggle/reload hotkeys work regardless of the menu or text dialog (F8
-        // must reload input.ini even with the menu open), so they are handled before anything
-        // else gets a chance to consume the key event. Held-down repeats are ignored the same
-        // way the menu's own Insert/Escape toggle already is (!event.key.repeat).
-        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
-            const int32_t scancode = static_cast<int32_t>(event.key.scancode);
-            if (scancode == toggle_scancode.load(std::memory_order_relaxed) &&
-                mouse_mode_available.load(std::memory_order_relaxed)) {
-                mouse_mode_on.store(!mouse_mode_on.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                continue;
-            }
-            if (scancode == reload_scancode.load(std::memory_order_relaxed)) {
-                reload_requested.store(true, std::memory_order_relaxed);
-                continue;
-            }
+        if (FilteredByModule(&event, window)) {
+            continue;
         }
-        if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED) {
-            window_focused = true;
-        } else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
-            window_focused = false;
-        }
-        // Mouse motion/buttons/wheel feed the pad only while captured (MOU-002..006); the
-        // overlay (menu) gets its own mouse handling below via BbOverlay::HandleEvent and is
-        // mutually exclusive with capture (WantsMouseCapture() is false whenever the menu is
-        // open), so there is no double consumption of the same event by both paths. Note:
-        // mouse_captured_last only updates once per PollEvents call (below the event loop), so
-        // a menu-opening event (L3+R3, Insert) followed within the same batch by a mouse event
-        // can still see the old captured state for one iteration; accepted as a one-frame
-        // edge case rather than re-evaluating capture per event for a cosmetic gain.
-        if (mouse_captured_last) {
-            // Direct camera: the BbMouse thread turns motion into camera angles, so it must not
-            // also reach the stick -- except while locked on, where a flick switches targets.
-            const Core::BloodborneCam& cam = Core::BloodborneCam::Instance();
-            const bool motion_to_stick = !cam.IsEnabled() || cam.IsLockedOn();
-            if (event.type == SDL_EVENT_MOUSE_MOTION && motion_to_stick) {
+        if (event.type == SDL_EVENT_MOUSE_MOTION) {
+            last_mouse_motion_ms = SDL_GetTicks();
+            // Just taken: the pointer's jump into relative mode is not a turn of the camera.
+            if (mouse_captured.load(std::memory_order_relaxed) && SDL_GetTicks() >= capture_settle_ms) {
                 std::scoped_lock lock{mouse_mutex};
-                mouse.dx += event.motion.xrel;
-                mouse.dy += event.motion.yrel;
-            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
-                std::scoped_lock lock{mouse_mutex};
-                const uint32_t mask = SDL_BUTTON_MASK(event.button.button);
-                if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) mouse.buttons |= mask;
-                else mouse.buttons &= ~mask;
-            } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
-                const uint64_t expiry = SDL_GetTicks() + kWheelPulseMs;
-                if (event.wheel.y > 0) g_wheel_expiry_ms[0] = expiry; // WHEEL_UP
-                else if (event.wheel.y < 0) g_wheel_expiry_ms[1] = expiry; // WHEEL_DOWN
-                if (event.wheel.x > 0) g_wheel_expiry_ms[3] = expiry; // WHEEL_RIGHT
-                else if (event.wheel.x < 0) g_wheel_expiry_ms[2] = expiry; // WHEEL_LEFT
+                mouse_dx += event.motion.xrel;
+                mouse_dy += event.motion.yrel;
             }
         }
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
@@ -226,19 +306,41 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
             continue;
         }
-        // The controller finishes the text dialog too: Cross (A) accepts, Circle (B) cancels.
-        if (text_active && event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
-            (event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH ||
-             event.gbutton.button == SDL_GAMEPAD_BUTTON_EAST)) {
-            std::scoped_lock lock{text_mutex};
-            text_state = event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : 2;
-            text_active = false;
-            SDL_StopTextInput(window);
-            UpdateTextTitle();
-            continue;
-        }
         if (BbOverlay::HandleEvent(event)) {
             continue;
+        }
+        // Mouse look: a click in the game takes the mouse (that click is not passed on as a
+        // button: runtime_pad.c reads the buttons only while it is held); F1 and leaving the
+        // window let it go.
+        if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && mouse_user_released) {
+            mouse_user_released = false; // the click takes the window back (it is not a game button)
+            continue;
+        }
+        if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !mouse_captured.load(std::memory_order_relaxed) &&
+            mouse_look.load(std::memory_order_relaxed) && !BbOverlay::MenuOpen() && !pointer) {
+            CaptureMouse(true);
+            continue;
+        }
+        // F3: the frame rate limit 30 on and off (the cinematic of Laurence hangs above 30 FPS).
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F3) {
+            BbFrameRate::SetLimit(BbFrameRate::Limit() == 30 ? 0 : 30);
+            continue;
+        }
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F1 &&
+            (mouse_captured.load(std::memory_order_relaxed) || mouse_grabbed || mouse_user_released)) {
+            mouse_user_released = !mouse_user_released;
+            if (mouse_user_released) {
+                CaptureMouse(false);
+            }
+            continue;
+        }
+        if (event.type == SDL_EVENT_MOUSE_WHEEL && mouse_captured.load(std::memory_order_relaxed)) {
+            const float notches = event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y : event.wheel.y;
+            std::scoped_lock lock{mouse_mutex};
+            (notches > 0 ? wheel_up : wheel_down) += notches != 0 ? 1 : 0;
+        }
+        if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+            CaptureMouse(false);
         }
         switch (event.type) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -249,105 +351,84 @@ bool WindowSDL::PollEvents() {
             height = h;
             break;
         }
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            TellMonitor(window);
+            break;
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+            // In the log: a session that ends here was closed, not lost to a crash.
+            if (is_open) {
+                std::printf("Window: closed (%s): the game ends\n",
+                            event.type == SDL_EVENT_QUIT ? "quit" : "close button");
+            }
             is_open = false;
             break;
         default:
             break;
         }
     }
-    // MOU-004: re-evaluated every PollEvents (not only on the events that could change it),
-    // because the menu can also close from the render thread (bbport_overlay.cpp's "Close"
-    // button sets menu_open there, not through an SDL event here).
-    UpdateMouseCapture();
-    BbPrompts::Apply();
-    UpdateMouseCamera();
+    // A request from the game's side (runtime_pad.c: the spray can taken): as a click would.
+    if (capture_requested.exchange(false, std::memory_order_relaxed) && !BbOverlay::MenuOpen() &&
+        !text_active) {
+        CaptureMouse(true);
+    }
+    // The menu, the name dialog and mouse_look=0 want the cursor.
+    if (mouse_captured.load(std::memory_order_relaxed) &&
+        (BbOverlay::MenuOpen() || text_active || !mouse_look.load(std::memory_order_relaxed))) {
+        CaptureMouse(false);
+    }
+    // The game's pointer menus: the mouse goes, and comes back when they close.
+    if (pointer && mouse_captured.load(std::memory_order_relaxed)) {
+        CaptureMouse(false);
+        released_for_pointer = true;
+        // Always the same place: the window's middle (not wherever the camera mouse was left).
+        int ww = 0, wh = 0;
+        SDL_GetWindowSize(window, &ww, &wh);
+        SDL_WarpMouseInWindow(window, float(ww) * 0.5f, float(wh) * 0.5f);
+        last_mouse_motion_ms = SDL_GetTicks();
+    } else if (!pointer && released_for_pointer) {
+        released_for_pointer = false;
+        if (mouse_look.load(std::memory_order_relaxed) && !BbOverlay::MenuOpen() && !text_active &&
+            (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS)) {
+            CaptureMouse(true);
+        }
+    }
+    {
+        const bool focused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+        const bool hold = focused && !mouse_user_released;
+        if (hold != mouse_grabbed) {
+            mouse_grabbed = hold;
+            SDL_SetWindowMouseGrab(window, hold);
+        }
+        // Taken for looking without a click once the window has focus (retried slowly: a
+        // compositor may refuse it).
+        static u64 last_try_ms = 0;
+        if (hold && !mouse_captured.load(std::memory_order_relaxed) &&
+            mouse_look.load(std::memory_order_relaxed) && !BbOverlay::MenuOpen() && !text_active &&
+            !pointer && !released_for_pointer && SDL_GetTicks() - last_try_ms > 500) {
+            last_try_ms = SDL_GetTicks();
+            CaptureMouse(true);
+        }
+    }
+    pointer_shown = pointer;
+    UpdateCursor();
     return is_open;
 }
 
-void WindowSDL::UpdateMouseCamera() {
-    Core::BloodborneCam& cam = Core::BloodborneCam::Instance();
-    const bool wanted = cam.IsConfigured() && mouse_mode_available.load(std::memory_order_relaxed) &&
-                        mouse_mode_on.load(std::memory_order_relaxed);
-    if (!wanted) {
-        cam_hook_failed = false; // F7/F8 retry after a failed attempt
-        if (cam.IsEnabled()) {
-            cam.SetEnabled(false);
-        }
-    } else if (!cam.IsEnabled() && !cam_hook_failed && mouse_captured_last) {
-        // Hooked once the game is actually being played (captured), F7 off unhooks so the
-        // stick/arrow keys drive the camera again.
-        cam_hook_failed = !cam.SetEnabled(true);
+// Issue #3: the OS cursor over the game. Hidden in fullscreen, and in a window after 3 s without
+// moving the mouse; always shown while the settings menu or a game's pointer menu is open.
+void WindowSDL::UpdateCursor() {
+    const bool fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+    // In a game menu (pointer_shown) it also goes after 1.5 s without moving, so that the tail of a
+    // closing menu does not leave it hanging over the game; any motion brings it back.
+    const u64 idle = SDL_GetTicks() - last_mouse_motion_ms;
+    const bool hide = !BbOverlay::MenuOpen() &&
+                      (mouse_captured.load(std::memory_order_relaxed) ||
+                       (pointer_shown ? idle > 1500 : (fullscreen || idle > 3000)));
+    if (hide != cursor_hidden) {
+        cursor_hidden = hide;
+        hide ? SDL_HideCursor() : SDL_ShowCursor();
     }
-    BbMouse::SetActive(mouse_captured_last && cam.IsEnabled());
-}
-
-bool WindowSDL::WantsMouseCapture() const {
-    // MOU-003: all of mouse mode on, window focused, menu closed, text dialog inactive.
-    // BbOverlay::CapturesInput() already covers both the menu and the text entry box.
-    return mouse_mode_on.load(std::memory_order_relaxed) && window_focused && !BbOverlay::CapturesInput();
-}
-
-void WindowSDL::UpdateMouseCapture() {
-    const bool wants = WantsMouseCapture();
-    if (wants == mouse_captured_last) {
-        return;
-    }
-    mouse_captured_last = wants;
-    SDL_SetWindowRelativeMouseMode(window, wants);
-    // Enabling relative mode hides the cursor by itself; disabling it does not document giving
-    // it back, so that side is made explicit here (SDL_ShowCursor is a no-op if already shown).
-    if (!wants) {
-        SDL_ShowCursor();
-    }
-    {
-        // MOU-005/MOU-007: leaving capture drops whatever motion/buttons/wheel accumulated so
-        // far -- a button still held when capture ends must never reach the pad as a press.
-        std::scoped_lock lock{mouse_mutex};
-        mouse.dx = mouse.dy = 0.0f;
-        mouse.buttons = 0;
-        mouse.wheel = 0;
-        mouse.captured = wants;
-    }
-    if (!wants) {
-        g_wheel_expiry_ms.fill(0);
-    }
-}
-
-void WindowSDL::TakeMouseInput(MouseInput& out) {
-    std::scoped_lock lock{mouse_mutex};
-    const uint64_t now = SDL_GetTicks();
-    mouse.wheel = 0;
-    for (size_t i = 0; i < g_wheel_expiry_ms.size(); ++i) {
-        if (g_wheel_expiry_ms[i] > now) mouse.wheel |= (1u << i);
-    }
-    out = mouse;
-    // Motion is drained (MOU-008: a delta is reported once, to the next sample only); held
-    // buttons are not -- a button still down stays down across calls until its SDL_EVENT_MOUSE_
-    // BUTTON_UP, same as SDL_GetMouseState would report. UpdateMouseCapture() is what clears
-    // buttons/wheel on the capture->uncaptured transition (MOU-005/MOU-007), not this function.
-    mouse.dx = mouse.dy = 0.0f;
-}
-
-void WindowSDL::ConfigureInput(bool mouse_mode_available_, int32_t toggle_scancode_, int32_t reload_scancode_) {
-    mouse_mode_available.store(mouse_mode_available_, std::memory_order_relaxed);
-    toggle_scancode.store(toggle_scancode_, std::memory_order_relaxed);
-    reload_scancode.store(reload_scancode_, std::memory_order_relaxed);
-    if (!mouse_mode_available_) {
-        // MOU-001: without mouse_to_joystick in input.ini, the mode does not exist; turning it
-        // off here also covers an F8 reload that removed the line while it was on.
-        mouse_mode_on.store(false, std::memory_order_relaxed);
-    } else if (!input_configured_once.exchange(true, std::memory_order_relaxed)) {
-        // MOU-002: "mode starts on" applies only to the very first load (game startup). A
-        // later F8 reload that keeps mouse_to_joystick present must not re-enable a mode the
-        // player turned off with the hotkey in between.
-        mouse_mode_on.store(true, std::memory_order_relaxed);
-    }
-}
-
-int WindowSDL::TakeInputReloadRequested() {
-    return reload_requested.exchange(false, std::memory_order_relaxed) ? 1 : 0;
 }
 
 } // namespace Frontend

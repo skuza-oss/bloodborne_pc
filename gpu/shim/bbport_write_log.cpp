@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_write_log.h"
+#include "bbport_free_check.h"
 
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#ifdef _WIN32
-#include <windows.h>
-#undef near
-#else
 #include <ucontext.h>
 #include <unistd.h>
-#endif
 #include <x86intrin.h>
 
 namespace BbWriteLog {
@@ -60,6 +56,12 @@ void Note(std::uint64_t address, const void* data, std::uint64_t size, Source so
     }
 }
 
+void NoteMirrorCopy(std::uint64_t address, std::uint64_t size) {
+    if (!Enabled()) return;
+    const std::array<unsigned char, 64> no_data{};
+    Record(address, no_data.data(), size, MirrorCopyIntent);
+}
+
 void Record(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
     static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
     Entry e{address, size, 0, __rdtsc(), source, tid};
@@ -82,36 +84,56 @@ void Record(std::uint64_t address, const void* data, std::uint64_t size, Source 
         }
     }
 }
+void DumpRange(std::uint64_t address, std::uint64_t size) {
+    if (Mode() == 0) {
+        std::fprintf(stderr, "Write log: off (BB_WRITE_LOG=1 lists the writes into this range)\n");
+        return;
+    }
+    const char* sources[] = {"backing",      "WriteData",           "fence",
+                             "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)", "DmaData",
+                             "GPU mirror copy (queued)"};
+    const std::uint64_t now = __rdtsc(), n = head.load();
+    int shown = 0;
+    for (std::uint64_t i = n; i-- > (n > Size ? n - Size : 0) && shown < 64;) {
+        const Entry& e = ring[i % Size];
+        if (e.address < address + size && address < e.address + e.size) {
+            std::fprintf(stderr,
+                         "Write log: into range %s %#llx +%llu first %#llx tid %u, %.3f s before\n",
+                         e.source < 8 ? sources[e.source] : "?", (unsigned long long)e.address,
+                         (unsigned long long)e.size, (unsigned long long)e.first, e.tid,
+                         double(now - e.tsc) / 3.0e9);
+            ++shown;
+        }
+    }
+    std::fprintf(stderr, "Write log: %d of %llu logged writes in %#llx +%llu\n", shown,
+                 (unsigned long long)n, (unsigned long long)address, (unsigned long long)size);
+}
 } // namespace BbWriteLog
 
 extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     using namespace BbWriteLog;
+    const auto* uc = static_cast<const ucontext_t*>(ucontext);
+    const auto* g = uc->uc_mcontext.gregs;
+    BbFreeCheck::DumpAtFault(std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_R14]));
     if (Mode() == 0) {
         return;
     }
-#ifdef _WIN32
-    // The loader passes EXCEPTION_POINTERS (see signal_context.cpp).
-    const CONTEXT* c = static_cast<const EXCEPTION_POINTERS*>(ucontext)->ContextRecord;
-    const std::uint64_t regs[] = {c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->R14, c->R15};
-#else
-    const auto* uc = static_cast<const ucontext_t*>(ucontext);
-    const auto* g = uc->uc_mcontext.gregs;
     const std::uint64_t regs[] = {std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_RBX]),
                                   std::uint64_t(g[REG_RCX]), std::uint64_t(g[REG_RDX]),
                                   std::uint64_t(g[REG_RSI]), std::uint64_t(g[REG_RDI]),
                                   std::uint64_t(g[REG_R14]), std::uint64_t(g[REG_R15])};
-#endif
     const char* names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r14", "r15"};
     for (int i = 0; i < 8; ++i) {
         std::fprintf(stderr, "Write log: %s=%#llx\n", names[i], (unsigned long long)regs[i]);
     }
     const char* sources[] = {"backing",      "WriteData",           "fence",
-                             "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)"};
+                             "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)", "DmaData",
+                             "GPU mirror copy (queued)"};
     const std::uint64_t now = __rdtsc();
     const auto print = [&](const Entry& e, const char* what) {
         std::fprintf(stderr,
                      "Write log: %s %s %#llx +%llu first %#llx tid %u, %.3f s before the fault\n",
-                     what, e.source < 6 ? sources[e.source] : "?", (unsigned long long)e.address,
+                     what, e.source < 8 ? sources[e.source] : "?", (unsigned long long)e.address,
                      (unsigned long long)e.size, (unsigned long long)e.first, e.tid,
                      double(now - e.tsc) / 3.0e9);
     };

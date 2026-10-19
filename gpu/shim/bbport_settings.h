@@ -4,8 +4,10 @@
 // start. Readers load the atomics every frame; writers are the menu and Load().
 
 #pragma once
-
+#include <array>
 #include <atomic>
+#include <cstdint>
+#include <string>
 
 namespace BbSettings {
 
@@ -17,61 +19,81 @@ inline bool IsFsr4(int upscaler) {
 }
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
-/// Frame generation (vk_frame_generation.h): frames generated between two of the game's.
-enum FrameGen : int { FrameGenOff = 0, FrameGenFsr3 = 1, FrameGenDlss = 2, FrameGenCount };
+enum class MenuLanguage { English, Russian };
 
 /// Game effects switched by the community patches at start (patches.py EFFECTS): ini key,
 /// menu label, default (the game's own behaviour).
 struct Effect {
     const char* key;
     const char* label;
+    const char* label_ru;
     bool default_on;
 };
 inline constexpr Effect Effects[] = {
-    {"effect_chromatic_aberration", "Chromatic aberration", true},
-    {"effect_dof", "Depth of field (DoF)", true},
-    {"effect_motion_blur", "Motion blur", true},
-    {"effect_ssao", "Ambient occlusion (SSAO)", true},
-    {"effect_game_aa", "Game anti-aliasing", true},
-    {"effect_dynamic_shadows", "Dynamic shadows", true},
-    {"effect_ssr", "Screen-space reflections (SSR)", false},
-    {"skip_intro", "Skip intro logos and movie", false},
-    {"debug_camera", "Free camera (Cross + L3)", false},
-    {"debug_menu", "Debug menu (requires font files)", false},
-    {"cheat_no_death", "Cheat: never die (minimum 1 HP)", false},
-    {"cheat_stealth", "Cheat: enemies cannot see you", false},
-    {"cheat_silent", "Cheat: enemies cannot hear you", false},
-    {"cheat_rally_no_decay", "Cheat: Rally never decays", false},
-    {"cheat_enemy_control", "Cheat: control targeted enemy (R3 / L3)", false},
-    {"tweak_no_rally", "Disable Rally (health recovery)", false},
-    {"tweak_camera_distance", "Increase camera distance", false},
-    {"tweak_no_camera_rotation", "Disable automatic camera rotation", false},
-    {"tweak_easy_run", "Run with less stick tilt", false},
-    {"tweak_ragdoll", "Dark Souls-style ragdoll physics", false},
-    {"tweak_circle_confirm", "Japanese/Asian buttons (Circle confirms)", false},
-    {"quit_to_desktop", "Quit to Desktop in the title and System menus", true},
+    {"effect_chromatic_aberration", "Chromatic aberration", "Хроматическая аберрация", true},
+    {"effect_dof", "Depth of field (DoF)", "Глубина резкости (DoF)", true},
+    {"effect_motion_blur", "Motion blur", "Размытие в движении", true},
+    {"effect_ssao", "Ambient occlusion (SSAO)", "Затенение SSAO", true},
+    {"effect_game_aa", "Game's own anti-aliasing", "Собственное сглаживание игры", true},
+    {"effect_dynamic_shadows", "Shadows from dynamic lights", "Тени от динамических источников", true},
+    {"effect_ssr", "Screen-space reflections (not in original game)", "Отражения SSR (не было в игре)", false},
+    {"effect_bloom", "Bloom", "Свечение (Bloom)", true},
+    {"skip_intro", "Skip startup intros", "Пропуск заставок при запуске", false},
+    {"debug_camera", "Free camera (Cross + L3)", "Свободная камера (Cross + L3)", false},
+    {"debug_menu", "Debug menu (requires font files)", "Debug menu (нужны файлы шрифтов)", false},
 };
 inline constexpr int EffectCount = int(sizeof(Effects) / sizeof(Effects[0]));
-/// Output resolutions: the upscaler's output and the UI host targets. The 16:9 ones change
-/// live; the ultrawide ones need the startup patch (patches.py ultrawide_writes, run.py).
-inline constexpr int OutputWidths[] = {1280, 1920, 2560, 3840, 2560, 3440, 3840, 5120, 3840, 5120};
-inline constexpr int OutputHeights[] = {720, 1080, 1440, 2160, 1080, 1440, 1600, 2160, 1080, 1440};
-inline constexpr int OutputCount = 10;
-inline constexpr int OutputDefault = 1; ///< 1920x1080, the game's own size
-/// Wider than 16:9: camera and HUD patched at startup.
-inline bool Ultrawide(int output) {
-    return OutputWidths[output] * 9 > OutputHeights[output] * 16;
-}
-
-/// Button prompts (bbport_prompts.cpp): the game's icons switch with the device in use, or stay.
-enum Prompts : int {
-    PromptsAuto = 0, PromptsPlayStation = 1, PromptsKeyboard = 2, PromptsXbox = 3, PromptsSwitch = 4, PromptsCount
-};
-
-/// Field of view (fov.py): the game's camera has 43 degrees.
+/// Field of view (fov.py, run.py at start): the game's camera has 43 degrees.
 inline constexpr int FovDefault = 43, FovMin = 30, FovMax = 90;
+/// SSR changes resource dimensions: the complete patch must precede construction.
+inline constexpr bool IsHotEffect(int effect) {
+    return effect >= 0 && effect < 8 && effect != 6;
+}
+/// Output aspect ratios, and the output resolutions of each: the upscaler's output and the UI's
+/// targets, changed live. The game keeps its 1920x1080 frame; for another aspect ratio its camera,
+/// HUD markers and UI placement follow the output at run time (bbport_guest_hooks, the UI
+/// composition). Auto: the group of the monitor the game is on.
+enum Aspect : int { AspectAuto = 0, Aspect4x3, Aspect16x10, Aspect16x9, Aspect21x9, Aspect32x9, AspectCount };
+struct OutputSize {
+    int width = 1920, height = 1080;
+    bool operator==(const OutputSize&) const = default;
+};
+inline constexpr OutputSize OutputDefault{1920, 1080}; ///< the game's own size
+constexpr std::uint32_t PackSize(OutputSize s) {
+    return std::uint32_t(s.width) | std::uint32_t(s.height) << 16;
+}
+constexpr OutputSize UnpackSize(std::uint32_t v) {
+    return {int(v & 0xffff), int(v >> 16)};
+}
+/// An aspect ratio's outputs, smallest first.
+struct OutputList {
+    std::array<OutputSize, 12> sizes{};
+    int count = 0;
+    const OutputSize* begin() const { return sizes.data(); }
+    const OutputSize* end() const { return sizes.data() + count; }
+    int IndexOf(OutputSize size) const; ///< -1: not in the list
+};
+/// bbport.ini value ("auto", "4:3", "16:10", "16:9", "21:9", "32:9").
+const char* AspectKey(int aspect);
+/// The monitor the game's window is on (window.cpp): Auto follows it. 0x0 until known.
+void SetMonitor(int width, int height);
+OutputSize Monitor();
+/// Auto resolved to the group nearest the monitor's aspect ratio (16:9 until it is known).
+int ResolvedAspect(int aspect);
+/// The output resolutions of an aspect ratio (Auto: the monitor's group and its own size).
+OutputList Outputs(int aspect);
+/// The output of `aspect` nearest `size` in height: another aspect ratio keeps the height.
+OutputSize NearestOutput(int aspect, OutputSize size);
+/// The output in use: the chosen resolution in the chosen aspect ratio.
+OutputSize CurrentOutput();
+/// "2560x1080".
+std::string SizeText(OutputSize size);
 
 struct Values {
+    std::atomic<MenuLanguage> menu_language{MenuLanguage::Russian};
+    /// Chosen in the menu (or already in bbport.ini): only then is it saved, so the language
+    /// the menu merely started with keeps following the launcher's (#134).
+    std::atomic<bool> menu_language_chosen{false};
     std::atomic<int> upscaler{UpscalerFsr3};
     std::atomic<int> preset{NativeAA};
     std::atomic<bool> sharpen{true};
@@ -86,8 +108,10 @@ struct Values {
     std::atomic<bool> show_fps{false};
     /// Silence the game while its window does not have focus (bbgpu_audio_muted).
     std::atomic<bool> mute_unfocused{false};
-    /// Keyboard and mouse button prompts: with the device in use (auto), or always one kind.
-    std::atomic<int> button_prompts{PromptsAuto};
+    /// Vertical field of view in degrees, 43 the game's (run.py, fov.py at start).
+    std::atomic<int> fov{FovDefault};
+    /// The settings menu's position (fraction of the screen), -1 until it is moved.
+    std::atomic<float> menu_x{-1.0f}, menu_y{-1.0f};
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};
@@ -95,41 +119,24 @@ struct Values {
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
-    std::atomic<int> output_res{OutputDefault}; ///< index into OutputWidths
-    /// Ultrawide outputs: the HUD's corner groups, 0 centred in 16:9 .. 100 at the screen edges
-    /// (hud_layout.py at start).
-    std::atomic<int> hud_position{100};
-    /// Vertical field of view in degrees, 43 the game's (run.py, fov.py at start).
-    std::atomic<int> fov{FovDefault};
+    std::atomic<int> aspect{AspectAuto};
+    /// The chosen output resolution (PackSize; CurrentOutput fits it to the aspect ratio).
+    std::atomic<std::uint32_t> output_res{PackSize(OutputDefault)};
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
     /// on the Steam Deck and older GPUs), -1 auto (strong discrete GPUs), 1 on. On restart.
     std::atomic<int> live_resolution{0};
+    /// FSR 3 frame generation (upscale/vk_frame_generation): a frame interpolated between each
+    /// two of the game's, shown between them (needs the upscaler's scaled path). Live.
+    std::atomic<bool> frame_generation{false};
+    /// Whether the GPU can (set by the renderer), or why not.
+    std::atomic<bool> frame_generation_supported{false};
+    std::atomic<const char*> frame_generation_problem{nullptr};
     /// Why FSR 4 cannot run (assets, device features), or null. Set by the renderer.
     std::atomic<const char*> fsr4_problem{nullptr};
     std::atomic<bool> fsr4_supported{false}, fsr411_supported{false};
-    /// DLSS (bbport_dlss.dll, NVIDIA RTX) is ready, or why not (null before the device exists).
+    /// DLSS (gpu/dlss_bridge, NVIDIA RTX) is ready, or why not (null before the device exists).
     std::atomic<bool> dlss_supported{false};
     std::atomic<const char*> dlss_problem{nullptr};
-    /// Frame generation and the frames per game frame (2x with FSR 3.1, up to 4x with DLSS on
-    /// RTX 50). dlssg_max_multiplier: 1 without DLSS Frame Generation.
-    std::atomic<int> frame_gen{FrameGenOff};
-    std::atomic<int> frame_gen_multiplier{2};
-    /// At most the frames the display shows between two of the game's (an uncapped game then
-    /// gets fewer generated frames); off: the multiplier as chosen.
-    std::atomic<bool> frame_gen_fit_display{false};
-    std::atomic<int> dlssg_max_multiplier{1};
-    std::atomic<const char*> frame_gen_problem{nullptr};
-    /// Generated frames per game frame the display has room for now (0: paused), and its
-    /// refresh rate (the presenter's measure, for the menu).
-    std::atomic<int> frame_gen_now{0};
-    std::atomic<int> frame_gen_display_hz{0};
-    /// The game's own frame rate (presenter, game frames only), shown beside the total when
-    /// frame generation adds frames.
-    std::atomic<float> game_fps{0.0f};
-    /// The game's frame rate cap frame generation needs (VideoOut applies it), 0 for none: with
-    /// FIFO presentation (V-Sync; AMD has no Mailbox) at most refresh / (generated + 1), or each
-    /// extra frame waits for the display and generation pauses.
-    std::atomic<int> frame_gen_flip_limit{0};
 
     /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;
@@ -137,13 +144,15 @@ struct Values {
     bool startup_object_motion = true;
     bool startup_effects[EffectCount]{};
     int startup_model_lod = 0;
-    int startup_output_res = OutputDefault;
-    int startup_hud_position = 100;
-    int startup_fov = FovDefault;
+    /// The output the startup patch was made for (BB_OUTPUT_RES), else 0x0.
+    OutputSize startup_output{0, 0};
     int startup_live_resolution = 0;
+    int startup_fov = FovDefault;
 };
 
 Values& Get();
+/// Localized overlay text; the Language selector itself stays in English.
+const char* MenuText(const char* english, const char* russian);
 
 /// Reads the file, then the environment overrides. Called once at start.
 void Load();
@@ -162,6 +171,5 @@ void Save();
 float PresetScale(int preset);
 const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
-const char* FrameGenName(int frame_gen);
 
 } // namespace BbSettings

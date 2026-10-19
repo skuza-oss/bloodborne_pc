@@ -30,13 +30,8 @@ struct OrbisNpSessionInvitationEventParam {
     OrbisNpInvitationId invitationId;
     OrbisNpSessionInvitationEventFlag flag;
     char padding[4];
-    Libraries::Np::OrbisNpOnlineId onlineId; // accepting (local) user
-    s32 userId;                              // accepting (local) user
-    Libraries::Np::OrbisNpOnlineId referralOnlineId; // inviter
-    Libraries::Np::OrbisNpAccountId referralAccountId; // inviter
+    Libraries::Np::OrbisNpOnlineId onlineId;
 };
-static_assert(offsetof(OrbisNpSessionInvitationEventParam, userId) == 140);
-static_assert(offsetof(OrbisNpSessionInvitationEventParam, referralOnlineId) == 144);
-static_assert(offsetof(OrbisNpSessionInvitationEventParam, referralAccountId) == 168);
+static_assert(sizeof(OrbisNpSessionInvitationEventParam) == 0x8c);
 
 } // namespace Libraries::InvitationDialog

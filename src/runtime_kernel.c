@@ -3,6 +3,7 @@
  * use FreeBSD numbering; host errno values never reach the guest directly. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,12 +12,16 @@
 #include <sched.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/time.h>
-#include <x86intrin.h>
-#ifndef _WIN32
+#include <sys/syscall.h>
+#include <dlfcn.h>
+#include <dirent.h>
+#include <ucontext.h>
+#include <signal.h>
+#include <sys/uio.h>
 #include <sys/random.h>
 #include <sys/resource.h>
-#endif
+#include <sys/time.h>
+#include <x86intrin.h>
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define PAGE 16384
 
@@ -91,11 +96,7 @@ static ABI uint64_t tsc_frequency(void) {
     if (!tsc_hz) {
         struct timespec a,b,nap={0,20000000};
         clock_gettime(CLOCK_MONOTONIC,&a); uint64_t t0=__rdtsc();
-#ifdef _WIN32
-        (void)nap; compat_sleep_ns(20000000);
-#else
         nanosleep(&nap,NULL);
-#endif
         clock_gettime(CLOCK_MONOTONIC,&b); uint64_t t1=__rdtsc();
         uint64_t ns=(uint64_t)(b.tv_sec-a.tv_sec)*1000000000+(uint64_t)(b.tv_nsec-a.tv_nsec);
         tsc_hz=(t1-t0)*1000000000/(ns ? ns : 1);
@@ -106,14 +107,28 @@ static ABI uint64_t tsc_frequency(void) {
 uint64_t runtime_process_time_us(void) { return process_time(); }
 uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
 uint64_t runtime_tsc_frequency(void) { return tsc_frequency(); }
+/* bbport (frame stats): how often and how long the game sleeps (it polls GPU labels that way). */
+static _Atomic uint64_t sleep_calls, sleep_total_ns;
+void runtime_sleep_stats(uint64_t *calls, uint64_t *ns) {
+    *calls=atomic_exchange(&sleep_calls,0); *ns=atomic_exchange(&sleep_total_ns,0);
+}
 static int sleep_ns(uint64_t ns) {
+    struct timespec t={.tv_sec=(time_t)(ns/1000000000),.tv_nsec=(long)(ns%1000000000)}, a, b;
+    clock_gettime(CLOCK_MONOTONIC,&a);
+    int result=0;
 #ifdef _WIN32
+    /* bbport Windows: winpthreads' nanosleep rounds up to the 15.6 ms scheduler tick; a
+     * high-resolution waitable timer sleeps the time asked (runtime_win32.c). */
     compat_sleep_ns(ns);
+    (void)t;
 #else
-    struct timespec t={.tv_sec=(time_t)(ns/1000000000),.tv_nsec=(long)(ns%1000000000)};
-    while (nanosleep(&t,&t)) if (errno!=EINTR) return errno;
+    while (nanosleep(&t,&t)) if (errno!=EINTR) { result=errno; break; }
 #endif
-    return 0;
+    clock_gettime(CLOCK_MONOTONIC,&b);
+    atomic_fetch_add(&sleep_calls,1);
+    atomic_fetch_add(&sleep_total_ns,(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec)));
+    runtime_wait_note(3,(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec)));
+    return result;
 }
 static ABI int32_t kernel_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
 static ABI int32_t posix_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
@@ -130,13 +145,8 @@ static ABI int32_t kernel_nanosleep(const GuestTimespec *rq,GuestTimespec *rem) 
 typedef struct { int32_t minuteswest, dsttime; } GuestTimezone;
 static ABI int32_t kernel_gettimezone(GuestTimezone *tz) {
     if (!tz) return ERR(22);
-    time_t now=time(NULL);
-#ifdef _WIN32
-    tz->minuteswest=(int32_t)(-compat_utc_offset(now)/60); tz->dsttime=0;
-#else
-    struct tm local; localtime_r(&now,&local);
-    tz->minuteswest=(int32_t)(-local.tm_gmtoff/60); tz->dsttime=0;
-#endif
+    time_t now=time(NULL); struct tm local; localtime_r(&now,&local);
+    tz->minuteswest=(int32_t)(-RUNTIME_TM_GMTOFF(local)/60); tz->dsttime=0;
     return 0;
 }
 static ABI int32_t posix_gettimeofday(GuestTimeval *tv,GuestTimezone *tz) {
@@ -162,10 +172,41 @@ static ABI __attribute__((noreturn)) void hard_exit(int status) {
     fflush(stdout);
     _exit(status);
 }
-static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t argument) {
+static ABI void raise_exception(uint32_t code,uint64_t argument) {
+    /* The renderer's own debug assertions on blur-kernel sample counts (Yebis, GPUMath.cpp 3199 and
+     * GPUTextureUtil.cpp 18141: "nBaseSamples >= 3", "nSamples >= 2"; a game-data value that
+     * got small, seen at +0xbbc429 and +0xc33efe). The code after the check goes on with the
+     * value, so a retail build just continued: logged, and the game goes on.
+     * BB_GAME_ASSERT_STOP=1 stops as before. */
+    {
+        const uint64_t base=0x800000000ull, hi=base+0x50d96dcull;
+        /* The call goes through an import stub: the first game address up the stack is the site. */
+        const uint64_t *frame=(const uint64_t *)__builtin_frame_address(0);
+        uint64_t at=0;
+        for (int i=0;i<64 && !at;++i) if (frame[i]>=base && frame[i]<hi) at=frame[i]-base;
+        static int stop=-1, told;
+        if (stop<0) { const char *e=getenv("BB_GAME_ASSERT_STOP"); stop=e && e[0]=='1'; }
+        if (!stop && code==0xa0020007u && ((at>=0xbbc3e0 && at<0xbbc700) || (at>=0xc33000 && at<0xc34200))) {
+            if (told++<5) printf("Runtime: the game's blur-kernel assertion at +0x%llx ignored (BB_GAME_ASSERT_STOP=1: stop)\n",(unsigned long long)at);
+            return;
+        }
+    }
     fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx\n",code,(unsigned long long)argument);
+    /* Who raised it: the caller and the game's return addresses further up this thread's stack. */
+    const uint64_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
+    const uint64_t caller=(uint64_t)__builtin_return_address(0);
+    fprintf(stderr,"STOP: called from %s0x%llx; game code up the stack:",
+            caller>=text_lo && caller<text_hi ? "+" : "host ",
+            (unsigned long long)(caller>=text_lo && caller<text_hi ? caller-text_lo : caller));
+    const uint64_t *stack=(const uint64_t *)__builtin_frame_address(0);
+    for (int i=0,found=0;i<256 && found<12;++i)
+        if (stack[i]>=text_lo && stack[i]<text_hi) { fprintf(stderr," +0x%llx",(unsigned long long)(stack[i]-text_lo)); ++found; }
+    fprintf(stderr,"\n");
     runtime_report();
-    exit(23);
+    /* Other threads still run (the game's network threads among them): no static destructors
+     * under them. */
+    fflush(NULL);
+    _exit(23);
 }
 static ABI int32_t print_backtrace(void) {
     fputs("Runtime: guest requested a backtrace (not available)\n",stderr);
@@ -195,19 +236,12 @@ static ABI int32_t guest_sigfillset(GuestSigset *set) { if (!set) return fail_po
 static ABI int32_t guest_sigemptyset(GuestSigset *set) { if (!set) return fail_posix(EINVAL); memset(set,0,sizeof(*set)); return 0; }
 typedef struct { GuestTimeval utime, stime; int64_t rest[14]; } GuestRusage;
 static ABI int32_t guest_getrusage(int who,GuestRusage *out) {
-    if (!out || (who!=0 && who!=1)) return fail_posix(EINVAL);
-    memset(out,0,sizeof(*out));
-#ifdef _WIN32
-    int64_t user=0,kernel=0;
-    compat_cpu_times(who,&user,&kernel);
-    out->utime=(GuestTimeval){user/1000000,user%1000000};
-    out->stime=(GuestTimeval){kernel/1000000,kernel%1000000};
-#else
     struct rusage r;
+    if (!out || (who!=0 && who!=1)) return fail_posix(EINVAL);
     getrusage(who==0 ? RUSAGE_SELF : RUSAGE_THREAD,&r);
+    memset(out,0,sizeof(*out));
     out->utime=(GuestTimeval){r.ru_utime.tv_sec,r.ru_utime.tv_usec};
     out->stime=(GuestTimeval){r.ru_stime.tv_sec,r.ru_stime.tv_usec};
-#endif
     return 0;
 }
 static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,uint64_t *oldlen,const void *new_value,uint64_t newlen) {
@@ -215,11 +249,7 @@ static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,u
     if (!name || namelen<2 || new_value) return fail_posix(EINVAL);
     if (name[0]==1 && name[1]==37) { /* kern.arandom */
         if (!old || !oldlen) return fail_posix(EINVAL);
-#ifdef _WIN32
-        if (compat_random(old,(size_t)*oldlen)) return fail_posix(EIO);
-#else
         if (getrandom(old,(size_t)*oldlen,0)<0) return fail_posix(errno);
-#endif
         return 0;
     }
     if (name[0]==6 && (name[1]==7 || name[1]==3)) { /* hw.pagesize / hw.ncpu */
@@ -320,3 +350,258 @@ static const RuntimeExport exports[]={
     {"pthread_setspecific",posix_key_set}, {"pthread_getspecific",key_get},
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
+
+static void sample_start(void);
+static void sample_report(void);
+
+/* bbport (frame stats): time guest threads spend blocked in the runtime (condition variables,
+ * mutexes, semaphores, sleeps), by thread and guest call site: the first return address into the
+ * game's code on the stack. Shows where the game waits for the GPU (labels, frame pacing). */
+typedef struct { _Atomic uint64_t key; uint64_t site, site2, site3; int tid, kind; char name[16]; _Atomic uint64_t count, ns; } WaitSite;
+static WaitSite wait_sites[512];
+static _Thread_local int wait_tid;
+void runtime_guest_call_sites(uint64_t out[3]);
+/* The first three return addresses into the game's code on this thread's stack (guest offsets). */
+static void guest_call_sites(uint64_t out[3]) {
+    const uintptr_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
+    static _Thread_local uintptr_t stack_hi;
+    if (!stack_hi) {
+#ifdef _WIN32
+        uintptr_t low=0; bb_thread_stack(&low,&stack_hi);
+#else
+        pthread_attr_t attr; void *base=NULL; size_t size=0;
+        if (!pthread_getattr_np(pthread_self(),&attr)) { pthread_attr_getstack(&attr,&base,&size); pthread_attr_destroy(&attr); }
+        stack_hi=(uintptr_t)base+size;
+#endif
+    }
+    const uintptr_t *sp=(const uintptr_t *)__builtin_frame_address(0);
+    int found=0;
+    out[0]=out[1]=out[2]=0;
+    for (int i=0;i<400 && found<3 && (uintptr_t)(sp+i+1)<=stack_hi;++i) if (sp[i]>=text_lo && sp[i]<text_hi) out[found++]=sp[i]-text_lo;
+}
+void runtime_wait_note(int kind, uint64_t ns) {
+    static int enabled=-1;
+    if (enabled<0) enabled=getenv("BB_FRAME_STATS")!=NULL;
+    if (!enabled) return;
+    if (!wait_tid) wait_tid=(int)syscall(SYS_gettid);
+    uint64_t sites[3];
+    guest_call_sites(sites);
+    const uint64_t key=((sites[0]<<20)^(sites[1]*0x9E3779B1ull)^(sites[2]<<7)^((uint64_t)wait_tid<<4)^(uint64_t)kind)|1;
+    for (uint64_t i=0,slot=(key*0x9E3779B97F4A7C15ull)>>55;i<512;++i) {
+        WaitSite *w=&wait_sites[(slot+i)%512];
+        uint64_t expected=0;
+        if (atomic_load(&w->key)==key || atomic_compare_exchange_strong(&w->key,&expected,key)) {
+            if (!w->tid) { w->site=sites[0]; w->site2=sites[1]; w->site3=sites[2]; w->kind=kind; pthread_getname_np(pthread_self(),w->name,sizeof(w->name)); w->tid=wait_tid; }
+            atomic_fetch_add(&w->count,1); atomic_fetch_add(&w->ns,ns);
+            return;
+        }
+    }
+}
+void runtime_wait_report(double frames) {
+    sample_start();
+    sample_report();
+    static const char *kinds[]={"cond","mutex","sema","sleep"};
+    struct { WaitSite *w; uint64_t ns, count; } rows[512]; int n=0;
+    for (int i=0;i<512;++i) {
+        uint64_t ns=atomic_exchange(&wait_sites[i].ns,0), count=atomic_exchange(&wait_sites[i].count,0);
+        if (count) { rows[n].w=&wait_sites[i]; rows[n].ns=ns; rows[n].count=count; ++n; }
+    }
+    if (!n || frames<=0) return;
+    static FILE *dump; static int dump_checked;
+    if (!dump_checked) { const char *path=getenv("BB_WAIT_LOG"); if (path && *path) dump=fopen(path,"w"); dump_checked=1; }
+    if (dump) {
+        for (int i=0;i<n;++i)
+            fprintf(dump,"%s %d %s %#lx %#lx %#lx %.2f %.3f\n", rows[i].w->name, rows[i].w->tid, kinds[rows[i].w->kind&3],
+                    (unsigned long)rows[i].w->site, (unsigned long)rows[i].w->site2, (unsigned long)rows[i].w->site3,
+                    rows[i].count/frames, rows[i].ns/(frames*1e6));
+        fprintf(dump,"--\n"); fflush(dump);
+    }
+    for (int i=1;i<n;++i) for (int j=i;j>0 && rows[j].ns>rows[j-1].ns;--j) { __typeof__(rows[0]) t=rows[j]; rows[j]=rows[j-1]; rows[j-1]=t; }
+    printf("Guest waits per frame (thread kind +site):");
+    for (int i=0;i<n && i<12;++i) if (rows[i].ns/rows[i].count<5000000)
+        printf("%s %s %s +%#lx<+%#lx<+%#lx %.1fx %.2f ms", i ? ";" : "", rows[i].w->name, kinds[rows[i].w->kind&3],
+               (unsigned long)rows[i].w->site, (unsigned long)rows[i].w->site2, (unsigned long)rows[i].w->site3,
+               rows[i].count/frames, rows[i].ns/(frames*1e6));
+    printf("\n");
+}
+
+/* bbport BB_SAMPLE_THREAD=<name> (with frame stats): where that thread runs, sampled with SIGPROF
+ * every 0.5 ms; reported with the wait profile. A thread that never blocks but waits for the GPU
+ * shows up spinning in its polling loop. */
+#define SAMPLE_SLOTS 8192
+static _Atomic uint64_t sample_keys[SAMPLE_SLOTS], sample_counts[SAMPLE_SLOTS];
+static uint64_t sample_rips[SAMPLE_SLOTS], sample_callers[SAMPLE_SLOTS];
+static _Atomic uint64_t samples_total;
+/* The GPU library's code (/proc/self/maps at start): host samples outside it (libc, libstdc++)
+ * are keyed with the nearest return address into it, the GPU code that called them. */
+static uint64_t gpu_text_lo, gpu_text_hi;
+static void sample_handler(int sig, siginfo_t *info, void *context) {
+    (void)sig; (void)info;
+    const ucontext_t *uc=(const ucontext_t *)context;
+    uint64_t rip=(uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+    const uint64_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
+    /* Host code: keyed with its guest caller, the first return address into the game on the stack. */
+    uint64_t caller=0;
+    if (rip>=text_lo && rip<text_hi) {
+        /* Game code: keyed with its caller too, the return address of a frame-pointer frame (a
+         * polling loop's wait function is one place; who waits is what matters). */
+        uint64_t frame[2]={0};
+        struct iovec local={frame,sizeof(frame)}, remote={(void *)uc->uc_mcontext.gregs[REG_RBP],sizeof(frame)};
+        if (process_vm_readv(getpid(),&local,1,&remote,1,0)==(ssize_t)sizeof(frame) &&
+            frame[1]>=text_lo && frame[1]<text_hi)
+            caller=frame[1]-text_lo;
+    } else {
+        uint64_t stack[256]={0};
+        struct iovec local={stack,sizeof(stack)}, remote={(void *)uc->uc_mcontext.gregs[REG_RSP],sizeof(stack)};
+        const ssize_t got=process_vm_readv(getpid(),&local,1,&remote,1,0);
+        for (ssize_t i=0;i<got/8;++i) if (stack[i]>=text_lo && stack[i]<text_hi) { caller=stack[i]-text_lo; break; }
+        if (!caller && gpu_text_hi && (rip<gpu_text_lo || rip>=gpu_text_hi))
+            for (ssize_t i=0;i<got/8;++i)
+                if (stack[i]>=gpu_text_lo && stack[i]<gpu_text_hi) { caller=stack[i]|(1ull<<63); break; }
+    }
+    const uint64_t key=(rip*0x9E3779B97F4A7C15ull)^caller^1;
+    atomic_fetch_add(&samples_total,1);
+    for (uint64_t i=0,slot=(key*0x9E3779B97F4A7C15ull)>>51;i<SAMPLE_SLOTS;++i) {
+        _Atomic uint64_t *k=&sample_keys[(slot+i)%SAMPLE_SLOTS];
+        uint64_t expected=0;
+        if (atomic_load(k)==key || atomic_compare_exchange_strong(k,&expected,key)) {
+            sample_rips[(slot+i)%SAMPLE_SLOTS]=rip; sample_callers[(slot+i)%SAMPLE_SLOTS]=caller;
+            atomic_fetch_add(&sample_counts[(slot+i)%SAMPLE_SLOTS],1);
+            return;
+        }
+    }
+}
+static void *sampler_main(void *arg) {
+    const char *name=(const char *)arg;
+    /* "main": the process's first thread (several threads are named after the binary). */
+    pid_t tid=!strcmp(name,"main") ? getpid() : 0;
+    while (!tid) {
+        DIR *dir=opendir("/proc/self/task");
+        struct dirent *e;
+        while (dir && (e=readdir(dir))) {
+            char path[300], comm[32]={0};
+            snprintf(path,sizeof(path),"/proc/self/task/%s/comm",e->d_name);
+            FILE *f=fopen(path,"r");
+            if (!f) continue;
+            if (fgets(comm,sizeof(comm),f) && !strncmp(comm,name,strlen(name))) tid=(pid_t)atoi(e->d_name);
+            fclose(f);
+        }
+        if (dir) closedir(dir);
+        if (!tid) sleep(1);
+    }
+    printf("Runtime: sampling thread %s (%d)\n",name,(int)tid);
+    /* A game thread interrupted 2000 times a second: its system calls in the runtime's services
+     * return EINTR where the game never sees one. Another game with the main thread sampled lost the
+     * device and crashed on garbage within minutes, four runs out of four (2026-10-15). */
+    if (tid==getpid() || strncmp(name,"bb:",3))
+        printf("Runtime: warning: sampling a game thread disturbs it (diagnostics only)\n");
+    for (;;) {
+        if (syscall(SYS_tgkill,getpid(),tid,SIGPROF)) break;
+        struct timespec t={0,500000};
+        nanosleep(&t,NULL);
+    }
+    return NULL;
+}
+static void sample_start(void) {
+    static int started;
+    const char *name=getenv("BB_SAMPLE_THREAD");
+    if (started || !name || !*name) return;
+    started=1;
+    struct sigaction action={0};
+    action.sa_sigaction=sample_handler;
+    action.sa_flags=SA_SIGINFO|SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGPROF,&action,NULL);
+    FILE *maps=fopen("/proc/self/maps","r");
+    char line[512];
+    while (maps && fgets(line,sizeof(line),maps)) {
+        unsigned long lo, hi; char perms[8];
+        if (strstr(line,"libbbgpu.so") && sscanf(line,"%lx-%lx %7s",&lo,&hi,perms)==3 && perms[2]=='x') {
+            gpu_text_lo=lo; gpu_text_hi=hi; break;
+        }
+    }
+    if (maps) fclose(maps);
+    pthread_t thread;
+    pthread_create(&thread,NULL,sampler_main,(void *)name);
+    pthread_detach(thread);
+}
+/* BB_SAMPLE_REPORT_SECONDS=N (with BB_SAMPLE_THREAD): the samples every N seconds whether frames
+ * come or not (a hang while loading shows no frame statistics). */
+static void *sample_reporter(void *arg) {
+    const unsigned seconds=(unsigned)(uintptr_t)arg;
+    for (;;) {
+        /* SIGPROF (the sampler) interrupts sleeps: the rest is slept again. */
+        struct timespec left={(time_t)seconds,0};
+        while (nanosleep(&left,&left)!=0 && errno==EINTR) {}
+        sample_report();
+        fflush(stdout);
+    }
+    return NULL;
+}
+__attribute__((constructor)) static void sample_report_timer(void) {
+    const char *v=getenv("BB_SAMPLE_REPORT_SECONDS");
+    const unsigned seconds=v ? (unsigned)atoi(v) : 0;
+    if (!seconds || !getenv("BB_SAMPLE_THREAD")) return;
+    sample_start();
+    pthread_t thread;
+    pthread_create(&thread,NULL,sample_reporter,(void *)(uintptr_t)seconds);
+    pthread_detach(thread);
+}
+static void sample_report(void) {
+    static int got_dumped;
+    if (!got_dumped) {
+        got_dumped=1;
+        const char *got=getenv("BB_DUMP_GOT"); /* a guest GOT slot (offset): which host function it calls */
+        if (got && *got) {
+            const uint64_t target=*(const uint64_t *)(0x800000000ull+strtoull(got,NULL,0));
+            Dl_info dl={0};
+            dladdr((void *)target,&dl);
+            printf("Runtime: GOT %s -> %#lx %s:%s+%#lx\n",got,(unsigned long)target,dl.dli_fname ? dl.dli_fname : "?",
+                   dl.dli_sname ? dl.dli_sname : "?",(unsigned long)(target-(uint64_t)(dl.dli_sname ? dl.dli_saddr : dl.dli_fbase)));
+        }
+    }
+    const uint64_t total=atomic_exchange(&samples_total,0);
+    if (!total) return;
+    static struct { uint64_t rip, caller, count; } rows[SAMPLE_SLOTS]; int n=0;
+    for (int i=0;i<SAMPLE_SLOTS;++i) { uint64_t c=atomic_exchange(&sample_counts[i],0); if (c) { rows[n].rip=sample_rips[i]; rows[n].caller=sample_callers[i]; rows[n].count=c; ++n; } }
+    for (int i=1;i<n;++i) for (int j=i;j>0 && rows[j].count>rows[j-1].count;--j) { __typeof__(rows[0]) t=rows[j]; rows[j]=rows[j-1]; rows[j-1]=t; }
+    /* BB_SAMPLE_ALL=1: every sampled address as module+offset, one per line (for addr2line). */
+    static int all=-1;
+    if (all<0) { const char *v=getenv("BB_SAMPLE_ALL"); all=v && v[0]=='1'; }
+    if (all) {
+        for (int i=0;i<n;++i) {
+            Dl_info dl={0};
+            dladdr((void *)rows[i].rip,&dl);
+            const char *module=dl.dli_fname ? strrchr(dl.dli_fname,'/') : NULL;
+            char from[96]="";
+            if (rows[i].caller && !(rows[i].caller>>63)) {
+                snprintf(from,sizeof(from)," from game+%#lx",(unsigned long)rows[i].caller);
+            } else if (rows[i].caller>>63) {
+                const uint64_t c=rows[i].caller&~(1ull<<63);
+                Dl_info cl={0};
+                dladdr((void *)c,&cl);
+                snprintf(from,sizeof(from)," from %#lx",(unsigned long)(c-(uint64_t)cl.dli_fbase));
+            }
+            printf("Sample: %s+%#lx %llu%s\n",module ? module+1 : "?",
+                   (unsigned long)(rows[i].rip-(uint64_t)dl.dli_fbase),(unsigned long long)rows[i].count,from);
+        }
+    }
+    printf("Thread samples (%llu):",(unsigned long long)total);
+    for (int i=0;i<n && i<16;++i) {
+        const uint64_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
+        if (rows[i].rip>=text_lo && rows[i].rip<text_hi) {
+            printf("%s +%#lx (from +%#lx) %.1f%%",i?";":"",(unsigned long)(rows[i].rip-text_lo),
+                   (unsigned long)rows[i].caller,100.0*rows[i].count/total);
+            continue;
+        }
+        Dl_info dl={0};
+        dladdr((void *)rows[i].rip,&dl);
+        const char *module=dl.dli_fname ? strrchr(dl.dli_fname,'/') : NULL;
+        printf("%s host:%s%s%s+%#lx (from +%#lx) %.1f%%",i?";":"",module ? module+1 : "?",dl.dli_sname ? ":" : "",
+               dl.dli_sname ? dl.dli_sname : "",(unsigned long)(rows[i].rip-(dl.dli_sname ? (uint64_t)dl.dli_saddr : (uint64_t)dl.dli_fbase)),
+               (unsigned long)rows[i].caller,100.0*rows[i].count/total);
+    }
+    printf("\n");
+}
+/* The first three return addresses into the game's code on the calling thread's stack. */
+void runtime_guest_call_sites(uint64_t out[3]) { guest_call_sites(out); }
