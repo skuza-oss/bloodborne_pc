@@ -39,13 +39,14 @@ CONFIG_FILE = CONFIG_DIR / 'settings.json'
 PATCH_VERSION = '01.09'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-# This build; GitHub release tags are windows-v<VERSION>.
-VERSION = '1.9.2'
+# This build: upstream's release, then this Windows build's number (0.6.1: upstream 0.6, build 1).
+# GitHub release tags are windows-v<VERSION>.
+VERSION = '0.6.1'
 # Co-op: the community server that answers the game's own server requests.
 COMMUNITY_SERVER = 'https://thehuntersdream.com'
-RELEASES_API = 'https://api.github.com/repos/Supermedo/bloodborne_pc/releases/latest'
-RELEASES_PAGE = 'https://github.com/Supermedo/bloodborne_pc/releases/latest'
-RELEASES_LIST_API = 'https://api.github.com/repos/Supermedo/bloodborne_pc/releases?per_page=100'
+RELEASES_API = 'https://api.github.com/repos/skuza-oss/bloodborne_pc/releases/latest'
+RELEASES_PAGE = 'https://github.com/skuza-oss/bloodborne_pc/releases/latest'
+RELEASES_LIST_API = 'https://api.github.com/repos/skuza-oss/bloodborne_pc/releases?per_page=100'
 # The oldest version Advanced > Other versions offers: older ones cannot install themselves the
 # same way (--install-update) or read today's settings.
 OLDEST_INSTALLABLE = '1.8.2'

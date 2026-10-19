@@ -5,10 +5,21 @@ THIS PROJECT IS NOT RELATED TO SHADPS4. ALL QUESTIONS RELATED TO THIS PROJECT SH
 
 **English** · [Русский](docs/original-readme/README.ru.md)
 
+> ### This fork: the latest upstream engine on Windows
+> **skuza-oss/bloodborne_pc** follows [deadinside28's upstream](https://github.com/deadinside28/bloodborne_pc)
+> releases (now **0.6**: its own renderer, the new memory model on every GPU, frame rate by
+> hooks, real occlusion queries, the NVIDIA light-shaft and 8 GB VRAM fixes, online on shadPS4
+> 0.20) and builds them for Windows on top of [Supermedo's Windows port](https://github.com/Supermedo/bloodborne_pc).
+> Versions are upstream's release plus a build number: **0.6.1** = upstream 0.6, build 1.
+> Not in this build yet: Supermedo's own frame generation (FSR 3.1 / DLSS-FG) and its
+> `input.ini` keyboard/mouse system (upstream's bindings and button prompts replace it).
+> Problems with this build: [issues here](https://github.com/skuza-oss/bloodborne_pc/issues),
+> not upstream's or Supermedo's.
+>
 > ### Windows version
 > This repository also builds bbport natively for **Windows 10/11** (MSYS2 CLANG64), with a
 > launcher (`Bloodborne.exe`) that has every setting in one window, in 13 languages: unpack the
-> zip from [Releases](https://github.com/Supermedo/bloodborne_pc/releases/latest), start
+> zip from [Releases](https://github.com/skuza-oss/bloodborne_pc/releases/latest), start
 > `Bloodborne.exe`, pick your game folder and press **PLAY**. See [Windows](#windows) below and
 > [packaging/windows/README.md](packaging/windows/README.md).
 >
