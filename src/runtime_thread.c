@@ -11,6 +11,7 @@
 #include <sched.h>
 #include <setjmp.h>
 #include <errno.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
@@ -40,7 +41,7 @@ typedef struct GuestThread {
     void *argument, *result;
     ThreadAttr attr;
     char name[32];
-    int detached, finished, joined, host_owned;
+    int detached, finished, joined, host_owned, started;
     jmp_buf exit_jump;
     struct GuestThread *next;
     unsigned char *stack_memory; /* the low stack it runs on (Windows: switched to at its start) */
@@ -48,6 +49,7 @@ typedef struct GuestThread {
 } GuestThread;
 
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t started_cond=PTHREAD_COND_INITIALIZER;
 static ThreadAttr *attributes;
 static GuestThread *threads;
 static _Thread_local GuestThread *current;
@@ -261,6 +263,7 @@ static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
+    pthread_mutex_lock(&lock); t->started=1; pthread_cond_broadcast(&started_cond); pthread_mutex_unlock(&lock);
 #ifdef _WIN32
     /* winpthreads ignores a given stack: the guest runs on its low one, fully committed (the
      * game's frames skip Windows' guard pages). */
@@ -302,7 +305,20 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     pthread_attr_destroy(&host);
     if (e) { fprintf(stderr,"STOP: host pthread_create failed: %d\n",e); exit(21); }
     if (t->detached) pthread_detach(t->host);
-    pthread_mutex_lock(&lock); ++created; pthread_mutex_unlock(&lock);
+    /* Return once the thread runs, as a PS4 thread would be by then. Dantelion's thread wrapper
+     * detaches instead of joining, and its owner frees it (mutex included) when its job never
+     * marked itself running: the movie audio thread (Mv_AudioPlayThread) that a busy host started
+     * after its movie had stopped panicked "Mutex is not initialized" (DLLightMutex.cpp:126).
+     * Windows can hold a new thread back for milliseconds (loader lock, DLL thread notifications). */
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME,&until);
+    until.tv_sec+=2;
+    pthread_mutex_lock(&lock);
+    while (!t->started && pthread_cond_timedwait(&started_cond,&lock,&until)!=ETIMEDOUT) {}
+    const int late=!t->started;
+    ++created;
+    pthread_mutex_unlock(&lock);
+    if (late) fprintf(stderr,"Runtime: guest thread '%s' has not started after 2 s\n",t->name);
     printf("Runtime: guest thread '%s' created (stack=%llu, prio=%d)\n",t->name,(unsigned long long)stack,t->attr.prio);
     return 0;
 }
