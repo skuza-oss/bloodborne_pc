@@ -144,6 +144,29 @@ void Relay::RememberPeer(std::string_view online_id, u32 addr_nbo, u16 port_nbo)
     AddAliasLocked(id, addr_nbo, port_nbo, "signaling");
 }
 
+bool Relay::RelayOnlyEndpoint(std::string_view online_id, u32* addr_nbo, u16* port_nbo) {
+    if (online_id.empty()) {
+        return false;
+    }
+    std::scoped_lock lock{mutex_};
+    if (server_addr_ == 0 || local_ids_.empty()) {
+        return false;
+    }
+    const std::string id = PadId(online_id);
+    Peer& peer = peers_[id];
+    if (peer.addr == 0 || peer.port == 0) {
+        peer.id = id;
+        peer.addr = htonl(0xA9FE0000u | (next_pseudo_++ & 0xFFFFu));
+        peer.port = htons(3173);
+        peer.relayed = true;
+        peer.relayed_since = std::chrono::steady_clock::now();
+        AddAliasLocked(id, peer.addr, peer.port, "relay only, shadNet has no endpoint for it");
+    }
+    *addr_nbo = peer.addr;
+    *port_nbo = peer.port;
+    return true;
+}
+
 void Relay::AddAliasLocked(const std::string& id, u32 addr_nbo, u16 port_nbo, const char* from) {
     if (addr_nbo == 0 || port_nbo == 0) {
         return;

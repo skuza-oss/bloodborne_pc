@@ -1424,6 +1424,22 @@ u16 GetMmServerUdpPort() {
     return g_mm.server_udp_port;
 }
 
+// shadNet learns a player's endpoint from its UDP echo; a server whose echo never answers
+// (Seamless Hunt's, 2026-10-20: nothing comes back on its UDP port) has none to give, and the
+// peer is reached through the relay only.
+static bool RelayOnlyPeer(std::string_view target_online_id, u32* out_addr, u16* out_port,
+                          std::string_view why) {
+    if (!Core::Net::P2P::Relay::Instance().RelayOnlyEndpoint(target_online_id, out_addr,
+                                                             out_port)) {
+        LOG_WARNING(Lib_NpMatching2, "no endpoint for '{}' ({}) and no relay", target_online_id,
+                    why);
+        return false;
+    }
+    LOG_INFO(Lib_NpMatching2, "no endpoint for '{}' ({}): through the relay only",
+             target_online_id, why);
+    return true;
+}
+
 bool RequestSignalingInfos(std::string_view target_online_id, u32* out_addr, u16* out_port) {
     if (!out_addr || !out_port) {
         return false;
@@ -1457,29 +1473,29 @@ bool RequestSignalingInfos(std::string_view target_online_id, u32* out_addr, u16
         if (!g_mm.sig_cv.wait_for(lock, std::chrono::seconds(5),
                                   [&] { return g_mm.sig_replies.count(pkt_id) > 0; })) {
             LOG_WARNING(Lib_NpMatching2, "timed out for '{}'", target_online_id);
-            return false;
+            return RelayOnlyPeer(target_online_id, out_addr, out_port, "shadNet timed out");
         }
         reply = std::move(g_mm.sig_replies[pkt_id]);
         g_mm.sig_replies.erase(pkt_id);
     }
     if (reply.first != ShadNet::ErrorType::NoError) {
-        return false;
+        return RelayOnlyPeer(target_online_id, out_addr, out_port,
+                             fmt::format("shadNet error {}", static_cast<int>(reply.first)));
     }
 
     shadnet::RequestSignalingInfosReply rep;
     const std::string proto = ExtractProtoBytes(reply.second);
     if (proto.empty() || !rep.ParseFromString(proto)) {
-        return false;
+        return RelayOnlyPeer(target_online_id, out_addr, out_port, "empty shadNet reply");
     }
     const std::string addr_str = rep.target_ip();
     const u16 port_host = static_cast<u16>(rep.target_port());
-    if (addr_str.empty() || port_host == 0) {
-        return false;
-    }
-
     u32 addr_nbo = 0;
-    if (Libraries::Net::sceNetInetPton(Net::ORBIS_NET_AF_INET, addr_str.c_str(), &addr_nbo) <= 0) {
-        return false;
+    if (addr_str.empty() || port_host == 0 ||
+        Libraries::Net::sceNetInetPton(Net::ORBIS_NET_AF_INET, addr_str.c_str(), &addr_nbo) <= 0 ||
+        addr_nbo == 0) {
+        return RelayOnlyPeer(target_online_id, out_addr, out_port,
+                             fmt::format("shadNet gave ip='{}' port={}", addr_str, port_host));
     }
     *out_addr = addr_nbo;
     *out_port = Libraries::Net::sceNetHtons(port_host);

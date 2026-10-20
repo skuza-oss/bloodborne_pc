@@ -46,6 +46,10 @@ public:
     void SetLocalId(std::string_view online_id);
     /// A peer and the endpoint signaling uses for it.
     void RememberPeer(std::string_view online_id, u32 addr_nbo, u16 port_nbo);
+    /// A peer shadNet has no endpoint for (its UDP echo never answered): the endpoint signaling
+    /// already uses for it, else a made-up one (169.254.x.x, never reached directly), and every
+    /// frame to it goes through the relay. False when the relay is off or not set up yet.
+    bool RelayOnlyEndpoint(std::string_view online_id, u32* addr_nbo, u16* port_nbo);
 
     // ---- the transport ----------------------------------------------------------------------
     using SendRaw = std::function<void(std::span<const u8>, const Endpoint&)>;
