@@ -74,9 +74,16 @@ bool ResolvePeerEndpointUnremembered(const NpMatching2::MemberCache& member, u32
     }
 
     const std::string online_id = OnlineIdString(member.np_id.handle);
-    return !online_id.empty() &&
-           NpSignaling::Transport::ResolvePeer(online_id, out_addr, out_port) && *out_addr != 0 &&
-           *out_port != 0;
+    if (online_id.empty()) {
+        return false;
+    }
+    if (NpSignaling::Transport::ResolvePeer(online_id, out_addr, out_port) && *out_addr != 0 &&
+        *out_port != 0) {
+        return true;
+    }
+    // No endpoint from the room or from shadNet (a lookup on the reader thread is skipped, and
+    // this member is not tried again): the relay carries it.
+    return Core::Net::P2P::Relay::Instance().RelayOnlyEndpoint(online_id, out_addr, out_port);
 }
 
 // BBSC relay fallback: the transport learns which online id sits behind each endpoint.
@@ -119,7 +126,8 @@ void ProcessSignalingPacket(const void* data, u32 len, u32 from_addr, u16 from_p
     const auto* buf = static_cast<const u8*>(data);
     const auto nbytes = static_cast<size_t>(len);
 
-    if (nbytes == sizeof(NpSignaling::StunEcho)) {
+    // A 6-byte signaling packet ("SHAD" + type + 1 byte) is not the server's echo.
+    if (nbytes == sizeof(NpSignaling::StunEcho) && !HasSignalingMagic(buf, nbytes)) {
         NpSignaling::StunEcho echo{};
         std::memcpy(&echo, buf, sizeof(echo));
         HandleStunEcho(echo);
@@ -1629,8 +1637,13 @@ void StartMatching2(NpMatching2::ContextObject& ctx) {
         u32 peer_addr = 0;
         u16 peer_port = 0;
         if (!ResolvePeerEndpoint(member, &peer_addr, &peer_port)) {
+            LOG_WARNING(Lib_NpSignaling, "Matching2: member {} '{}' has no endpoint, skipped",
+                        member_id, OnlineIdString(member.np_id.handle));
             continue;
         }
+        LOG_INFO(Lib_NpSignaling, "Matching2: member {} '{}' at {:#x}:{} (room gave {:#x}:{})",
+                 member_id, OnlineIdString(member.np_id.handle), peer_addr,
+                 Net::sceNetNtohs(peer_port), member.addr, Net::sceNetNtohs(member.port));
 
         s32 transport_id = 0;
         s32 status = NpSignaling::ORBIS_NP_SIGNALING_CONN_STATUS_PENDING;
