@@ -513,7 +513,7 @@ BBNET_EXPORT void bbnet_image_ready(uint64_t base, uint64_t size) {
             const auto folder = id.path() / "CUSA00207" / "SPRJ0005";
             if (std::filesystem::is_directory(folder, error)) {
                 setenv("BBSC_SAVE_DIR", folder.string().c_str(), 0);
-                std::printf("BBSC: save folder %s\n", folder.c_str());
+                std::printf("BBSC: save folder %s\n", folder.string().c_str());
                 break;
             }
         }
@@ -522,6 +522,31 @@ BBNET_EXPORT void bbnet_image_ready(uint64_t base, uint64_t size) {
     // while the game runs (session teardown, the host's lamp): its code pages stay writable
     // (shadPS4 maps them so; the port maps them read and execute).
     unsigned writable = 0;
+#ifdef _WIN32
+    // Windows: the image's executable regions from VirtualQuery (its views allow writes,
+    // posix_memory.cpp); mprotect there changes one region at a time.
+    constexpr DWORD Executable =
+        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    for (unsigned long long at = base; at < base + size;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info))) {
+            break;
+        }
+        const auto region = reinterpret_cast<unsigned long long>(info.BaseAddress);
+        const unsigned long long start = std::max<unsigned long long>(region, base);
+        const unsigned long long end =
+            std::min<unsigned long long>(region + info.RegionSize, base + size);
+        if (info.State == MEM_COMMIT && (info.Protect & Executable) != 0 && start < end) {
+            writable += mprotect(reinterpret_cast<void*>(start), end - start,
+                                 PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+            std::printf("BBSC: code %#llx-%#llx writable\n", start, end);
+        }
+        if (end <= at) {
+            break;
+        }
+        at = end;
+    }
+#endif
     if (FILE* maps = std::fopen("/proc/self/maps", "r")) {
         char line[512];
         while (std::fgets(line, sizeof(line), maps)) {
