@@ -11,6 +11,12 @@
 #include "common/types.h"
 
 extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
+#ifdef _WIN32
+// Memory the runtime's map does not hold (the game's image and other host-owned memory the game
+// sees, from 0x800000000): its committed region from VirtualQuery (bbnet_glue.cpp).
+extern "C" int bbnet_host_memory_info(uintptr_t address, int* prot, uintptr_t* start,
+                                      uintptr_t* end);
+#endif
 
 namespace Core {
 
@@ -54,14 +60,21 @@ public:
             }
         }
         int p = 0, type = -1;
+        uintptr_t mapping_start = address & ~uintptr_t(0xfff);
         uintptr_t mapping_end = 0;
-        if (!runtime_memory_vma_info(address, &p, &type, &mapping_end)) {
-            return -1;
-        }
         // The runtime's map gives the end of the mapping, not its start: the address itself
         // stands for it (callers check address >= start).
+        if (!runtime_memory_vma_info(address, &p, &type, &mapping_end)) {
+#ifdef _WIN32
+            if (!bbnet_host_memory_info(address, &p, &mapping_start, &mapping_end)) {
+                return -1;
+            }
+#else
+            return -1;
+#endif
+        }
         auto& slot = cache[next++ % cache.size()];
-        slot = {address & ~u64(0xfff), mapping_end, u32(p), now};
+        slot = {mapping_start, mapping_end, u32(p), now};
         *start = reinterpret_cast<void*>(slot.start);
         *end = reinterpret_cast<void*>(slot.end);
         *prot = slot.prot;

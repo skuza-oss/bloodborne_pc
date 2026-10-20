@@ -482,6 +482,29 @@ BBNET_EXPORT uintptr_t bbnet_resolve(const char* scoped_nid) {
     return 0;
 }
 
+#ifdef _WIN32
+// core/memory.h: a committed region the runtime's map does not hold, with its protection as
+// MemoryProt bits (read 1, write 2, execute 4); 0 when not committed or not accessible.
+extern "C" int bbnet_host_memory_info(uintptr_t address, int* prot, uintptr_t* start,
+                                      uintptr_t* end) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) ||
+        info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return 0;
+    }
+    const DWORD access = info.Protect & 0xff;
+    const bool write = access == PAGE_READWRITE || access == PAGE_WRITECOPY ||
+                       access == PAGE_EXECUTE_READWRITE || access == PAGE_EXECUTE_WRITECOPY;
+    const bool exec = access == PAGE_EXECUTE || access == PAGE_EXECUTE_READ ||
+                      access == PAGE_EXECUTE_READWRITE || access == PAGE_EXECUTE_WRITECOPY;
+    const bool read = access != PAGE_EXECUTE;
+    *prot = (read ? 1 : 0) | (write ? 2 : 0) | (exec ? 4 : 0);
+    *start = reinterpret_cast<uintptr_t>(info.BaseAddress);
+    *end = *start + info.RegionSize;
+    return 1;
+}
+#endif
+
 BBNET_EXPORT void bbnet_image_mapped(uint8_t* image, uint64_t size) {
     // The Hunter's Dream backend reads the game's code before the patches change it.
     BbThd::SetImage(image, size);
