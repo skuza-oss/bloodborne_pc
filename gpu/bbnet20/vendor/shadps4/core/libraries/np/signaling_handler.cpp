@@ -122,6 +122,62 @@ void HandleStunEcho(const NpSignaling::StunEcho& echo) {
     Core::Net::P2P::Relay::Instance().SetSelfEndpoint(echo.ext_ip, echo.ext_port);
 }
 
+// BBSC's small packets, "SHAD" + type + body (the senders in bloodborne_re.cpp): 0x23 life (id u32,
+// dead u8, sequence u32), 0x24 the host's scaling (5 x u16 percent), 0x25 PvP (kind u8, on u8,
+// sequence u32), 0x26 the host's boss flags (count u8, count x u32), 0x27 the host's boss bar (s32).
+// Only stores what they say (the handlers do no game-memory work); false: not one of them.
+bool HandleBbscPacket(u8 type, const u8* buf, size_t nbytes) {
+    const u8* body = buf + 5;
+    const size_t size = nbytes - 5;
+    const auto u32_at = [body](size_t at) {
+        u32 value = 0;
+        std::memcpy(&value, body + at, sizeof(value));
+        return value;
+    };
+    switch (type) {
+    case 0x23:
+        if (size != 9) {
+            return false;
+        }
+        Core::Bloodborne::OnBbscLifePacket(u32_at(0), body[4], u32_at(5));
+        return true;
+    case 0x24: {
+        if (size != 10) {
+            return false;
+        }
+        std::uint16_t percent[5]{};
+        std::memcpy(percent, body, sizeof(percent));
+        Core::Bloodborne::OnBbscScalePacket(percent);
+        return true;
+    }
+    case 0x25:
+        if (size != 6) {
+            return false;
+        }
+        Core::Bloodborne::OnBbscPvpPacket(body[0], body[1]);
+        return true;
+    case 0x26: {
+        if (size < 1 || size != 1 + size_t{body[0]} * 4) {
+            return false;
+        }
+        std::vector<std::uint32_t> flags(body[0]);
+        if (!flags.empty()) {
+            std::memcpy(flags.data(), body + 1, flags.size() * 4);
+        }
+        Core::Bloodborne::OnBbscProgressPacket(flags.data(), flags.size());
+        return true;
+    }
+    case 0x27:
+        if (size != 4) {
+            return false;
+        }
+        Core::Bloodborne::OnBbscHostBossPacket(static_cast<std::int32_t>(u32_at(0)));
+        return true;
+    default:
+        return false;
+    }
+}
+
 void ProcessSignalingPacket(const void* data, u32 len, u32 from_addr, u16 from_port) {
     const auto* buf = static_cast<const u8*>(data);
     const auto nbytes = static_cast<size_t>(len);
@@ -172,6 +228,14 @@ void ProcessSignalingPacket(const void* data, u32 len, u32 from_addr, u16 from_p
     if (nbytes == sizeof(NpSignaling::SignalingBbscWorldFlags) &&
         type == static_cast<u8>(NpSignaling::SignalingPacketType::BbscWorldFlags)) {
         Core::Bloodborne::OnBbscWorldFlagsPacket(buf, static_cast<u32>(nbytes));
+        return;
+    }
+
+    // bbport: BBSC's own small packets (bloodborne_re.cpp sends them through
+    // SendBbscWorldFlagsToPeers). The BBSC mod reads them on its relay thread; here they come in
+    // with the signaling and were dropped (0.6.7: no partner's "dead"/"alive" ever arrived, so a
+    // guest whose host had reloaded after a wipe spectated on, waiting for a boss kill).
+    if (type >= 0x23 && type <= 0x27 && HandleBbscPacket(type, buf, nbytes)) {
         return;
     }
 
