@@ -34,6 +34,7 @@
 #include "core/bbsc_memscan.h"
 #include "core/bbsc_persistence.h"
 #include "core/bbsc_cinematic.h"
+#include "core/bbsc_keys.h"
 #include "imgui/bbsc_loading_layer.h"
 #include "core/cpu_patches.h"
 #include "core/debugger.h"
@@ -10762,6 +10763,43 @@ void TickBbscUnstuckKey() {
 #endif
 }
 
+// ---- Lock keys (2026-10-22) ---------------------------------------------------------------------
+// The user's friend after a co-op session (2026-10-22): in the Dream, no item and no headstone
+// worked - the leave locks (flag 4047, load wait) that TickBbscStuckLeaveLocks releases only within
+// 60 s after a session ended. F9 in the game window releases them at any time while no session is
+// on and nothing is loading. Ctrl+F9 is the way out when something else holds the menus: the local
+// player's HP to 0 through the game's own setter (0x018BCD40, the revive's), so the game's death
+// and the load at the last lamp follow.
+void TickBbscLockKeys() {
+    const int key = Core::Bbsc::KeyPressed(0x78 /* VK_F9 */);
+    if (key == 0 || image_base == 0) {
+        return;
+    }
+    const u64 player = GetLocalPlayerCharacter();
+    const s32 hp = player != 0 ? GetCharacterHp(player) : -1;
+    if (hp <= 0) {
+        LOG_INFO(Debug, "BBSC lock keys: {} ignored (no living local player)",
+                 key == 2 ? "Ctrl+F9" : "F9");
+        return;
+    }
+    const s32 state = GetSessionState();
+    const u64 global = GetGlobalState();
+    const bool loading = ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0;
+    if (key == 1) {
+        if (state != 0 || loading) {
+            LOG_INFO(Debug, "BBSC lock keys: F9 ignored (session state {}, loading {})", state,
+                     loading);
+            return;
+        }
+        ReleaseBbscLeaveLocks("F9");
+        return;
+    }
+    using SetHp = void PS4_SYSV_ABI (*)(u64 chr, s32 hp);
+    reinterpret_cast<SetHp>(image_base + 0x018BCD40)(player, 0);
+    LOG_INFO(Debug, "BBSC lock keys: Ctrl+F9 - local player HP {} -> 0 (now {}), session state {}",
+             hp, GetCharacterHp(player), state);
+}
+
 // 2026-10-01 test: the guest saw items it could not pick up. The prompt search 0x017D9FB0 takes
 // every item with +0x48 bit 0x40 and has no session check of its own, so an item without the bit
 // is "seen but not pickable". User rule: every item the guest can see must be pickable. Once a
@@ -13663,6 +13701,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscItemSurvey();
         TickBbscGuestItemsPickable();
         TickBbscUnstuckKey();
+        TickBbscLockKeys();
         TickBbscLifeBroadcast();
         TickBbscSessionEnd();
         TickBbscStrayForcedWarp();
