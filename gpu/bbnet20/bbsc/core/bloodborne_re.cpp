@@ -6533,6 +6533,7 @@ struct BbscLoadCoverState {
     bool active = false;
     bool game_screen_seen = false; // the game's own loading screen has shown during this cover
     bool own_screen = false;       // BBSC opened the loading screen (between / after the loads)
+    bool ends_on_respawn = false;  // no placement will end it: ends once loaded and alive
     s64 started_ms = 0;
     s64 load_over_ms = 0;          // the game's loading screen closed and no load is running
     s64 no_session_since_ms = 0;
@@ -6555,7 +6556,13 @@ void StartBbscLoadCover(std::string_view why) {
     bbsc_load_cover.active = true;
     bbsc_load_cover.started_ms = SteadyNowMs();
     bbsc_load_cover.why = std::string{why};
-    LOG_INFO(Debug, "BBSC load cover: fading out ({})", why);
+    // 2026-10-23 (the user, 0.6.8): after a wipe the host's respawn re-summons the guest, which
+    // fires JoinSession_White again - a "summon" cover while the join teleport, the only thing that
+    // ends one, already ran for this session. The guest played on behind the "Bloodborne" logo
+    // until the Hunter's Dream. Such a cover ends like a wipe cover.
+    bbsc_load_cover.ends_on_respawn = why == "wipe" || (why == "summon" && bbsc_join_teleport_done);
+    LOG_INFO(Debug, "BBSC load cover: fading out ({}{})", why,
+             bbsc_load_cover.ends_on_respawn ? ", ends on respawn" : "");
 }
 
 void EndBbscLoadCover(std::string_view how) {
@@ -6601,7 +6608,8 @@ void TickBbscLoadCover() {
     // map, so no follow load ran - and only the follow's arrival ended the cover. The loading screen
     // stayed up 75 s ("infinite loading screen unless you teleport"). A wipe cover ends once its
     // load is over and the respawn after it is done (curtain closed, alive), or 20 s after the load.
-    if (bbsc_load_cover.why == "wipe" && bbsc_load_cover.game_screen_seen) {
+    if (bbsc_load_cover.ends_on_respawn &&
+        (bbsc_load_cover.game_screen_seen || now - bbsc_load_cover.started_ms > 10'000)) {
         const u64 global = GetGlobalState();
         const u64 menu = ReadValue<u64>(image_base + MenuManPointerOffset, 0);
         const bool loading = (ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0) ||
@@ -6616,8 +6624,8 @@ void TickBbscLoadCover() {
             const bool respawned =
                 !BbscCurtainActive() && GetCharacterHp(GetLocalPlayerCharacter()) > 0;
             if ((respawned && since >= 2'000) || since >= 20'000) {
-                EndBbscLoadCover(respawned ? "wipe reload done, guest respawned"
-                                           : "wipe reload done, time limit after the load");
+                EndBbscLoadCover(respawned ? "reload done, guest respawned"
+                                           : "reload done, time limit after the load");
                 return;
             }
         }
@@ -10786,6 +10794,12 @@ void TickBbscLockKeys() {
     const u64 global = GetGlobalState();
     const bool loading = ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0;
     if (key == 1) {
+        // 2026-10-23: F9 also takes down a load cover left up while nothing loads (the guest alive
+        // behind the "Bloodborne" logo), in or out of a session.
+        if (bbsc_load_cover.active && !loading) {
+            EndBbscLoadCover("F9");
+            return;
+        }
         if (state != 0 || loading) {
             LOG_INFO(Debug, "BBSC lock keys: F9 ignored (session state {}, loading {})", state,
                      loading);
