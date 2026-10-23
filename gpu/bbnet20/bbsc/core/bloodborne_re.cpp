@@ -12321,7 +12321,10 @@ void TickBbscLifeBroadcast() {
 // window puts the local player back on the ground: the same in-map warp the respawn uses
 // (chr->vtable[0x5F8], see BbscRespawnInPlace) to the player's own position 0.5 m higher, then the
 // collision proxy reset 0x018BCF30(chr, 1) that the partner revive uses. Works solo and in co-op.
-#if defined(_WIN32) && defined(BBSC_MOD) // the DLL; the built-in build has no F8
+// 2026-10-24: the port has it too (user, host, 60 FPS on both: "im still floating above ground
+// sometimes"); it was the DLL's alone. The log line says how far the nearest other player was, to
+// tell a player standing on a partner's (stale) copy from one floating on nothing.
+#if defined(_WIN32) && defined(BBSC_MOD) // the DLL reads the key itself
 extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int key);
 extern "C" __declspec(dllimport) void* __stdcall GetForegroundWindow();
 extern "C" __declspec(dllimport) unsigned long __stdcall GetWindowThreadProcessId(void* window,
@@ -12330,7 +12333,7 @@ extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentProcessId();
 #endif
 
 void TickBbscUnstuckKey() {
-#if defined(_WIN32) && defined(BBSC_MOD) // the DLL; the built-in build has no F8
+#if defined(_WIN32) && defined(BBSC_MOD)
     static bool was_down = false;
     const bool down = (GetAsyncKeyState(0x77 /* VK_F8 */) & 0x8000) != 0;
     const bool pressed = down && !was_down;
@@ -12343,6 +12346,11 @@ void TickBbscUnstuckKey() {
     if (pid != GetCurrentProcessId()) {
         return; // F8 pressed in another window
     }
+#else
+    if (Core::Bbsc::KeyPressed(0x77 /* VK_F8 */) == 0 || image_base == 0) {
+        return; // the port: only in the game's window
+    }
+#endif
     const u64 player = GetLocalPlayerCharacter();
     const auto here = ReadCharacterTransform(player);
     if (!ReadablePointer(player, 0x410) || !here.has_value() || GetCharacterHp(player) <= 0) {
@@ -12364,9 +12372,39 @@ void TickBbscUnstuckKey() {
     WriteValue<u8>(player, 0x1E4, static_cast<u8>(ReadValue<u8>(player, 0x1E4) | 0x02));
     using PhysicsReset = void PS4_SYSV_ABI (*)(u64 chr, u8 flag);
     reinterpret_cast<PhysicsReset>(image_base + 0x018BCF30)(player, 1);
-    LOG_INFO(Debug, "BBSC unstuck: F8 - player put back at ({:.2f}, {:.2f}, {:.2f}), map {:#x}",
-             position[0], position[1], position[2], GetCurrentPackedMap());
-#endif
+    // The nearest other character (a partner's copy, an enemy) and where it is from us.
+    std::string nearest = "none";
+    const u64 world_chr = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+    const s32 count = ReadablePointer(world_chr, 0x68) ? ReadValue<s32>(world_chr, 0x30) : 0;
+    const u64 entries = count > 0 ? ReadValue<u64>(world_chr, 0x38) : 0;
+    if (count > 0 && count <= 64 &&
+        ReadablePointer(entries, static_cast<size_t>(count) * 0x38)) {
+        float best = 1e9f;
+        for (s32 i = 0; i < count; ++i) {
+            const u64 other = ReadValue<u64>(entries, static_cast<size_t>(i) * 0x38);
+            const auto at = other != 0 && other != player ? ReadCharacterTransform(other)
+                                                          : std::nullopt;
+            if (!at.has_value()) {
+                continue;
+            }
+            const float dx = at->position[0] - here->position[0];
+            const float dy = at->position[1] - here->position[1];
+            const float dz = at->position[2] - here->position[2];
+            const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (d < best) {
+                best = d;
+                nearest = fmt::format("type {} hp {}, {:.2f} m (dx {:.2f} dy {:.2f} dz {:.2f})",
+                                      GetCharacterType(other), GetCharacterHp(other), d, dx, dy,
+                                      dz);
+            }
+        }
+    }
+    LOG_INFO(Debug,
+             "BBSC unstuck: F8 - player put back at ({:.2f}, {:.2f}, {:.2f}), map {:#x}, session "
+             "state {}; nearest other character: {}",
+             position[0], position[1], position[2], GetCurrentPackedMap(), GetSessionState(),
+             nearest);
+    BBSC_TIMELINE("UNSTUCK", "F8: put back on the ground; nearest other character: {}", nearest);
 }
 
 // ---- Lock keys (2026-10-22) ---------------------------------------------------------------------
