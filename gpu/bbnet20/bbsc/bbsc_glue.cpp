@@ -33,10 +33,6 @@ void ShowPlayerMarkers(const PlayerMarker* markers, int count) {
     bbgpu_overlay_markers(out, n);
 }
 
-void SetCoopFrameCap(bool on) {
-    bbgpu_coop_frame_cap(on ? 1 : 0);
-}
-
 void StartIntro(std::string_view) {}
 
 } // namespace Core::Bbsc

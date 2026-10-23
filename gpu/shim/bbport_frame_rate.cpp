@@ -63,11 +63,6 @@ struct alignas(64) Live {
 Live* live = nullptr;
 int base_rate = 0;               /// the launched mode's rate (with BB_FPS_LIMIT)
 std::atomic<int> live_limit{0};
-/// Co-op sessions run at most this fast (2026-10-23: the guest fell through the ground after
-/// every teleport and both players floated, host 40-120 FPS unlocked; BBSC's testers saw the same
-/// with two uncapped games at different rates). BB_COOP_FPS_CAP=0: no co-op cap.
-constexpr int CoopRate = 60;
-std::atomic<bool> coop_cap{false};
 
 /// The pacer at the main loop's step (rdi: it): this frame's values.
 void PS4_SYSV_ABI FrameStep(u64 pacer) {
@@ -382,38 +377,16 @@ void PatchImage(unsigned char* image, std::uint64_t) {
 bool Unlocked() {
     return unlocked.load(std::memory_order_relaxed);
 }
-/// The pacer's target: the live limit (or the launched rate), the co-op cap over it.
-void Apply(const char* why) {
+void SetLimit(int fps) {
+    live_limit.store(fps, std::memory_order_relaxed);
     if (!unlocked.load(std::memory_order_relaxed) || !live) {
         return;
     }
-    const int fps = live_limit.load(std::memory_order_relaxed);
-    int rate = fps > 0 ? std::clamp(fps, 30, MaxRate) : base_rate;
-    if (coop_cap.load(std::memory_order_relaxed)) {
-        rate = std::min(rate, CoopRate);
-    }
+    const int rate = fps > 0 ? std::clamp(fps, 30, MaxRate) : base_rate;
     live->shortest = 1.0f / float(rate);
-    std::printf("Frame rate: limit %d FPS (live, %s)\n", rate, why);
-}
-void SetLimit(int fps) {
-    live_limit.store(fps, std::memory_order_relaxed);
-    Apply("set");
+    std::printf("Frame rate: limit %d FPS (live)\n", rate);
 }
 int Limit() {
     return live_limit.load(std::memory_order_relaxed);
 }
-void SetCoopCap(bool on) {
-    static const bool allowed = [] {
-        const char* env = std::getenv("BB_COOP_FPS_CAP");
-        return !(env && env[0] == '0');
-    }();
-    if (!allowed || coop_cap.exchange(on, std::memory_order_relaxed) == on) {
-        return;
-    }
-    Apply(on ? "co-op session: at most 60" : "co-op over");
-}
 } // namespace BbFrameRate
-
-extern "C" void bbgpu_coop_frame_cap(int on) {
-    BbFrameRate::SetCoopCap(on != 0);
-}

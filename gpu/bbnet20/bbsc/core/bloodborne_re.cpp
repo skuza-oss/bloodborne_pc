@@ -12319,8 +12319,10 @@ void TickBbscLifeBroadcast() {
 // Test 2026-10-01: the host rolled into the guest at an elevator, got stuck inside the guest's
 // character, backed out and floated (no gravity) from then on. Cause not found yet. F8 in the game
 // window puts the local player back on the ground: the same in-map warp the respawn uses
-// (chr->vtable[0x5F8], see BbscRespawnInPlace) to the player's own position 0.5 m higher, then the
-// collision proxy reset 0x018BCF30(chr, 1) that the partner revive uses. Works solo and in co-op.
+// (chr->vtable[0x5F8], see BbscRespawnInPlace) to the player's own position, then the collision
+// proxy reset 0x018BCF30(chr, 1) that the partner revive uses. Works solo and in co-op.
+// 2026-10-24: no longer 0.5 m higher - a player floating without gravity only went up with each
+// press (user: "f8 pushes me even more up when im already floating up").
 // 2026-10-24: the port has it too (user, host, 60 FPS on both: "im still floating above ground
 // sometimes"); it was the DLL's alone. The log line says how far the nearest other player was, to
 // tell a player standing on a partner's (stale) copy from one floating on nothing.
@@ -12364,7 +12366,6 @@ void TickBbscUnstuckKey() {
     }
     alignas(16) std::array<float, 4> position = here->position;
     alignas(16) std::array<float, 4> rotation = here->rotation;
-    position[1] += 0.5f;
     position[3] = 1.0f;
     rotation[3] = 0.0f;
     using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
@@ -12467,29 +12468,6 @@ constexpr float BbscMarkerEdge = 0.04f;      // how close to the frame's edge a 
 constexpr float BbscMarkerNearMetres = 15.0f;
 
 bool bbsc_markers_on = true;
-
-// ---- Co-op frame rate (2026-10-23) --------------------------------------------------------------
-// User: "my friend falling underground everytime and not even joining sometimes"; before that both
-// "running in air like it has ground". The host ran unlocked at 40-120 FPS (the frame rate note
-// above). The port now holds every co-op session (hosting, joining, a guest, an invader) at 60 FPS
-// or below, the rate the community's 60 FPS patches run at, and lifts it once the session is over.
-void TickBbscCoopFrameCap() {
-#ifdef BBSC_MOD
-    return; // the port's frame rate hooks; a stock emulator has its own limiter
-#endif
-    static bool capped = false;
-    const s32 state = GetSessionState();
-    const bool want = state >= 1 && state <= 6; // 7 leaving, 0 solo, -1 not known
-    if (want == capped) {
-        return;
-    }
-    capped = want;
-    Core::Bbsc::SetCoopFrameCap(want);
-    LOG_INFO(Debug, "BBSC frame rate: {} (session state {})",
-             want ? "co-op session, held at 60 FPS or below" : "solo again, the own limit is back",
-             state);
-    BBSC_TIMELINE("GAME", "frame rate: {}", want ? "co-op, held at 60 FPS or below" : "solo, own limit");
-}
 
 void TickBbscPlayerMarkers() {
 #ifdef BBSC_MOD
@@ -13779,7 +13757,19 @@ void TickBbscDeadWatchdog() {
                     limit, session_state, bbsc_spectate_active);
     }
     bbsc_spectate_active = false;
-    if (BbscDiedRightAfterRespawn("watchdog")) {
+    // 2026-10-24 (user, host): "im still floating above ground sometimes", at 60 FPS on both. In the
+    // host's timeline every float came after repeat deaths in one load revived on the spot by this
+    // watchdog (00:26:05, 00:27:02, 00:27:18, then F8 at 00:33 lifted the player 0.5 m each press and
+    // it stayed up: no gravity, the nearest other character 26 m away); a real reload (the Hunter's
+    // Dream) ended it. Those deaths never ran the game's death step (SoloPlayDeath), which the first
+    // death of a load does. So a repeat death now ends with the game's own death reload, the way the
+    // one right after a respawn in place already did; the first death of a load still respawns in
+    // place. BB_REPEAT_DEATH_IN_PLACE=1: the old revive on the spot.
+    static const bool in_place = [] {
+        const char* env = std::getenv("BB_REPEAT_DEATH_IN_PLACE");
+        return env && env[0] == '1';
+    }();
+    if ((repeat && !in_place) || BbscDiedRightAfterRespawn("watchdog")) {
         if (session_state == 6 && LivingPartnerExists()) {
             // Guest: hand over to TickBbscSpectate's wipe path (full reload beside the host).
             bbsc_spectate_name = "repeat death";
@@ -13797,7 +13787,8 @@ void TickBbscDeadWatchdog() {
             return;
         }
         BbscApplyDeathPenalty("watchdog");
-        RequestBbscDeathReload("watchdog: repeat death right after a respawn in place");
+        RequestBbscDeathReload(repeat ? "watchdog: repeat death in the same load"
+                                      : "watchdog: repeat death right after a respawn in place");
         return;
     }
     BbscApplyDeathPenalty("watchdog");
@@ -16419,7 +16410,6 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscUnstuckKey();
         TickBbscLockKeys();
         TickBbscPlayerMarkers();
-        TickBbscCoopFrameCap();
         TickBbscLifeBroadcast();
         TickBbscSessionEnd();
         TickBbscStrayForcedWarp();

@@ -19,6 +19,4 @@ bool Unlocked();
 /// community 60 FPS patch).
 void SetLimit(int fps);
 int Limit();
-/// Co-op: at most 60 FPS while on, over whatever the limit is (bbgpu_coop_frame_cap).
-void SetCoopCap(bool on);
 } // namespace BbFrameRate
