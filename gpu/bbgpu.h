@@ -70,6 +70,9 @@ typedef struct BbGpuMarker {
     char text[64];
 } BbGpuMarker;
 void bbgpu_overlay_markers(const BbGpuMarker *markers, int count);
+/* Co-op: the frame rate held at 60 or below while on (BBSC, in a session), back as it was when off
+ * (any thread). */
+void bbgpu_coop_frame_cap(int on);
 /* Native mouse look: turns the game's camera (radians, applied at its next update); 0 when the
  * camera hook is not in (another game version, BB_NATIVE_MOUSE=0) or the camera does not take the
  * turns now (lock-on, menus): drive the right stick then. */

@@ -12430,6 +12430,29 @@ constexpr float BbscMarkerNearMetres = 15.0f;
 
 bool bbsc_markers_on = true;
 
+// ---- Co-op frame rate (2026-10-23) --------------------------------------------------------------
+// User: "my friend falling underground everytime and not even joining sometimes"; before that both
+// "running in air like it has ground". The host ran unlocked at 40-120 FPS (the frame rate note
+// above). The port now holds every co-op session (hosting, joining, a guest, an invader) at 60 FPS
+// or below, the rate the community's 60 FPS patches run at, and lifts it once the session is over.
+void TickBbscCoopFrameCap() {
+#ifdef BBSC_MOD
+    return; // the port's frame rate hooks; a stock emulator has its own limiter
+#endif
+    static bool capped = false;
+    const s32 state = GetSessionState();
+    const bool want = state >= 1 && state <= 6; // 7 leaving, 0 solo, -1 not known
+    if (want == capped) {
+        return;
+    }
+    capped = want;
+    Core::Bbsc::SetCoopFrameCap(want);
+    LOG_INFO(Debug, "BBSC frame rate: {} (session state {})",
+             want ? "co-op session, held at 60 FPS or below" : "solo again, the own limit is back",
+             state);
+    BBSC_TIMELINE("GAME", "frame rate: {}", want ? "co-op, held at 60 FPS or below" : "solo, own limit");
+}
+
 void TickBbscPlayerMarkers() {
 #ifdef BBSC_MOD
     return; // the port's overlay draws them; a stock emulator has none
@@ -16358,6 +16381,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscUnstuckKey();
         TickBbscLockKeys();
         TickBbscPlayerMarkers();
+        TickBbscCoopFrameCap();
         TickBbscLifeBroadcast();
         TickBbscSessionEnd();
         TickBbscStrayForcedWarp();

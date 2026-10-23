@@ -20,5 +20,7 @@ struct PlayerMarker {
     char text[64] = {};
 };
 void ShowPlayerMarkers(const PlayerMarker* markers, int count);
+// Co-op: the port holds the frame rate at 60 or below while on (no-op elsewhere).
+void SetCoopFrameCap(bool on);
 
 } // namespace Core::Bbsc

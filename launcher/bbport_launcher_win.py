@@ -41,7 +41,7 @@ MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 # This build: upstream's release, then this Windows build's number (0.6.1: upstream 0.6, build 1).
 # GitHub release tags are windows-v<VERSION>.
-VERSION = '0.7.3'
+VERSION = '0.7.4'
 # Co-op: the community server that answers the game's own server requests.
 COMMUNITY_SERVER = 'https://thehuntersdream.com'
 RELEASES_API = 'https://api.github.com/repos/skuza-oss/bloodborne_pc/releases/latest'
