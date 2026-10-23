@@ -611,6 +611,11 @@ BBNET_EXPORT void bbnet_image_ready(uint64_t base, uint64_t size) {
             return Core::Bbsc::CinematicHandleEvent(*static_cast<const SDL_Event*>(event),
                                                     static_cast<SDL_Window*>(window));
         });
+        // BBSC 0.0.2: dead in co-op, the camera watching a living hunter reads R1 / L1 and the
+        // sticks (its pad.cpp hook in shadPS4). The pad state is only read, never changed.
+        bbgpu_add_pad_filter([](uint32_t* buttons, const uint8_t* sticks) {
+            Core::Bbsc::CinematicPadRead(*buttons, sticks[2], sticks[3], sticks[0], sticks[1]);
+        });
     }
     Core::Bloodborne::InstallSeamlessCoopPatches();
     Core::Bbsc::InstallPersistentSessionPatches();
