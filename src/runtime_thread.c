@@ -13,6 +13,10 @@
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #ifndef _WIN32
@@ -259,10 +263,24 @@ static void run_guest(void *p) {
     GuestThread *t=p;
     if (!setjmp(t->exit_jump)) t->result=t->entry(t->argument);
 }
+/* Guest priorities run 256 (highest) to 767; the game's are 700 except FMOD's (256-265).
+ * Host threads all ran at normal priority, so on 6-core CPUs the draw workers and game
+ * threads delayed FMOD's mixer and output threads: underruns heard as crackling.
+ * BB_THREAD_PRIORITY=0 keeps every thread at normal priority. (Supermedo 1.9.2, 08df6af) */
+static void set_host_priority(int prio) {
+#ifdef _WIN32
+    static int enabled=-1;
+    if (enabled<0) { const char *e=getenv("BB_THREAD_PRIORITY"); enabled=!e || e[0]!='0'; }
+    if (enabled && prio<400) SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_HIGHEST);
+#else
+    (void)prio;
+#endif
+}
 static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
+    set_host_priority(t->attr.prio);
     pthread_mutex_lock(&lock); t->started=1; pthread_cond_broadcast(&started_cond); pthread_mutex_unlock(&lock);
 #ifdef _WIN32
     /* winpthreads ignores a given stack: the guest runs on its low one, fully committed (the
