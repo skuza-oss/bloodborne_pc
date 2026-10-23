@@ -1824,8 +1824,11 @@ bool ApplyBloodborneSeamlessRoute(SendRequestPlan& plan) {
     plan.headers.emplace_back("X-ShadPS4-Bloodborne-Seamless", "1");
     // BBSC: SHADPS4_BBSC_NO_PLACEMENT_HEADER=1 disables the host-placement transport in both
     // directions (isolation test for the seamless join stall; cross-map preparation needs it).
+    // BBSC 0.0.2 (2026-10-13): only on the claim (/request), not on the search (/get) - a search with
+    // a placement locked every cross-map sign into "Preparing" for that one host, so on a public
+    // server with many hosts nobody's Kin Bell sign could be rung by anyone else.
     if (!EnvFlagEnabled("SHADPS4_BBSC_NO_PLACEMENT_HEADER") &&
-        (IsBloodborneSummonRequestPath(plan.path) || IsBloodborneSummonSearchPath(plan.path))) {
+        IsBloodborneSummonRequestPath(plan.path)) {
         if (const auto placement = Core::Bloodborne::GetSeamlessHostPlacementHeader()) {
             plan.headers.emplace_back(BloodborneHostPlacementHeader, *placement);
         }
@@ -1988,6 +1991,19 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
     }
 
     ApplyBloodborneSeamlessRoute(plan);
+    // BBSC 0.0.2: fewer messages / bloodstains per message_area request (Panic 265, see
+    // bloodborne_re.cpp).
+    if (!plan.body.empty() && plan.path.find("/message_area") != std::string::npos) {
+        std::string body(plan.body.begin(), plan.body.end());
+        if (const std::string changed = Core::Bloodborne::CapBbscAreaListRequest(plan.path, body);
+            !changed.empty()) {
+            plan.body.assign(body.begin(), body.end());
+            std::erase_if(plan.headers, [](const auto& header) {
+                return HeaderNameMatches(header.first, "Content-Length");
+            });
+            LOG_INFO(Lib_Http, "{} (reqId={})", changed, reqId);
+        }
+    }
 
     const bool online = EmulatorSettings.IsConnectedToNetwork();
     LOG_INFO(Lib_Http, "reqId={} dispatched to async worker [{} {} {}://{}:{}{}]", reqId,
