@@ -26,7 +26,7 @@ void ShutdownRuntime();
 // BBSC: one packet to every established signaling peer (the number it reached). Callable from any
 // thread.
 u32 SendBbscFollowToPeers(u32 packed_map, float x, float y, float z, float heading, u32 sequence,
-                          s32 lamp_point);
+                          s32 lamp_point, u8 host_reloads);
 u32 SendBbscWorldFlagsToPeers(const void* packet, u32 size);
 
 } // namespace Libraries::Np::NpSignaling::Helpers

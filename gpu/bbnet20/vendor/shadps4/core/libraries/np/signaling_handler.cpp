@@ -221,7 +221,7 @@ void ProcessSignalingPacket(const void* data, u32 len, u32 from_addr, u16 from_p
         std::memcpy(&follow, buf, nbytes);
         Core::Bloodborne::OnBbscHostFollowPacket(follow.packed_map, follow.x, follow.y, follow.z,
                                                  follow.heading, follow.sequence,
-                                                 follow.lamp_point);
+                                                 follow.lamp_point, follow.host_reloads);
         return;
     }
 

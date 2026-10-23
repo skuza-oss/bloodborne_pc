@@ -124,7 +124,10 @@ static_assert(sizeof(SignalingControl) == 0x32);
 struct SignalingBbscFollow {
     u8 magic[4] = {kSignalingMagic[0], kSignalingMagic[1], kSignalingMagic[2], kSignalingMagic[3]};
     u8 type = static_cast<u8>(SignalingPacketType::BbscFollow);
-    u8 kind = 0; // 0: "I am the host, this is where I am"
+    // Was `kind`, always 0. Now the host's reloads of the map it stays in (a lamp rest), counted
+    // 1..255 and wrapping past 0, so a guest reloads too and gets the enemies back; older builds
+    // send 0, which never changes.
+    u8 host_reloads = 0;
     u32 packed_map = 0;
     float x = 0.0f;
     float y = 0.0f;

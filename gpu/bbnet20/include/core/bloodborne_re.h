@@ -27,7 +27,8 @@ void TraceMatching2LeaveRoom(std::uintptr_t return_address, std::uint64_t room_i
 // BBSC warp together: a "the host is in this map" packet arrived from the signaling peer. Called
 // on the signaling receive thread, so it only records the message; TickBbscFollowHost acts on it.
 void OnBbscHostFollowPacket(std::uint32_t packed_map, float x, float y, float z, float heading,
-                            std::uint32_t sequence, std::int32_t lamp_point);
+                            std::uint32_t sequence, std::int32_t lamp_point,
+                            std::uint8_t host_reloads);
 // BBSC world state: one chunk of the host's event flags for its map block arrived (a whole
 // SignalingBbscWorldFlags packet). Signaling receive thread; only stores it.
 void OnBbscWorldFlagsPacket(const void* packet, std::uint32_t size);

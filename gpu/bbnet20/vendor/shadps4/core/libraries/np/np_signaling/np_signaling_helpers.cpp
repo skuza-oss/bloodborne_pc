@@ -317,7 +317,7 @@ u32 SendBbscWorldFlagsToPeers(const void* packet, u32 size) {
 }
 
 u32 SendBbscFollowToPeers(u32 packed_map, float x, float y, float z, float heading, u32 sequence,
-                          s32 lamp_point) {
+                          s32 lamp_point, u8 host_reloads) {
     const std::vector<BbscPeer> peers = EstablishedBbscPeers();
     if (peers.empty()) {
         return 0;
@@ -330,6 +330,7 @@ u32 SendBbscFollowToPeers(u32 packed_map, float x, float y, float z, float headi
     packet.heading = heading;
     packet.sequence = sequence;
     packet.lamp_point = lamp_point;
+    packet.host_reloads = host_reloads;
     u32 sent = 0;
     for (const BbscPeer& peer : peers) {
         if (Transport::SignalingSendTo(&packet, sizeof(packet), peer.addr, peer.port) > 0) {

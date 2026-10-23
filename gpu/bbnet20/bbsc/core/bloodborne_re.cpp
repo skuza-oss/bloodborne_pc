@@ -4719,6 +4719,7 @@ struct BbscFollowMessage {
     float arrival_heading{};
     s64 arrival_ms{};
     bool arrival_by_load{}; // the host was silent (loading) before it: a lamp, a reload
+    u8 host_reloads{};      // see "Resting at a lamp together"
 };
 
 std::mutex bbsc_follow_mutex;
@@ -4743,11 +4744,26 @@ bool BbscHostDreamStateReady();
 void ApplyBbscHostDreamState(std::string_view why);
 void RestoreBbscOwnDreamState(std::string_view why);
 
+// ---- Resting at a lamp together (2026-10-23) ----------------------------------------------------
+// User (host, lamp menu mod): "when i use it to reset area enemies re apear for me but not for my
+// friend, he cant see them and dont get xp when i kill them". Resting reloads the host's map and
+// brings its enemies back; the guest stays in that same map, so the follow below has nothing to do
+// and the guest's game keeps them dead. Every enemy runs in each player's own game, so the guest's
+// copy of a respawned enemy never appears and the guest gets nothing for it. The host now counts
+// its reloads that end in the map it was in (SignalingBbscFollow::host_reloads); a guest in that
+// map that sees the count change reloads it too, through the same session warp as a follow, and
+// comes out beside the host at the lamp. A wipe reloads both players anyway: a guest that loaded
+// itself in the meantime skips it.
+constexpr s64 BbscRestOwnLoadMs = 30'000;      // we loaded this recently: the host's was a wipe
+constexpr s64 BbscRestReloadWindowMs = 60'000; // a guest busy (dead, loading) longer gives up
+
 // Host side: say where we are, so a guest that is somewhere else can come to us.
 void TickBbscFollowBroadcast() {
     static s64 last_ms = 0;
     static u32 sequence = 0;
     static u32 announced_map = 0;
+    static u8 reloads = 0;
+    static bool load_seen = false;
     if (!BbscWarpTogetherEnabled() || image_base == 0) {
         return;
     }
@@ -4762,14 +4778,24 @@ void TickBbscFollowBroadcast() {
         return;
     }
     const u64 global = GetGlobalState();
-    if (!ReadablePointer(global, 0x1598) || ReadValue<u8>(global, 0x1592) == 0 ||
-        ReadValue<u8>(global, 0x08) != 0) {
-        return; // not in our own world, or a load is in flight and the map is not settled
+    if (!ReadablePointer(global, 0x1598) || ReadValue<u8>(global, 0x1592) == 0) {
+        return; // not in our own world
+    }
+    if (ReadValue<u8>(global, 0x08) != 0) {
+        load_seen = true;
+        return; // a load is in flight and the map is not settled
     }
     const u32 map = GetCurrentPackedMap();
     if (!IsUsablePackedMap(map)) {
         return;
     }
+    if (load_seen && map == announced_map) {
+        reloads = reloads == 255 ? 1 : static_cast<u8>(reloads + 1);
+        LOG_INFO(Debug, "BBSC rest: host reloaded map {:#x} (a lamp rest), reload {} told to the guest",
+                 map, reloads);
+        BBSC_TIMELINE("REST", "rest: host reloaded map {:#x}, reload {}", map, reloads);
+    }
+    load_seen = false;
     const auto here = ReadCharacterTransform(GetLocalPlayerCharacter());
     if (!here.has_value()) {
         return;
@@ -4779,7 +4805,7 @@ void TickBbscFollowBroadcast() {
     const s32 lamp_point = ReadablePointer(global, 0x1530) ? ReadValue<s32>(global, 0x1528) : -1;
     const u32 peers = Libraries::Np::NpSignaling::Helpers::SendBbscFollowToPeers(
         map, here->position[0], here->position[1], here->position[2], here->rotation[1], sequence,
-        lamp_point);
+        lamp_point, reloads);
     if (map != announced_map) {
         const bool moved = announced_map != 0; // not the first report of this session
         announced_map = map;
@@ -4885,6 +4911,9 @@ void TickBbscFollowHost() {
     static u32 target_map = 0;
     static u32 attempts_map = 0;
     static int attempts = 0;
+    static bool host_reloads_known = false;
+    static u8 host_reloads_seen = 0;
+    static s64 rest_reload_since_ms = 0; // the host rested in our map: reload it too (0: no)
     if (!BbscWarpTogetherEnabled() || image_base == 0) {
         return;
     }
@@ -4899,6 +4928,8 @@ void TickBbscFollowHost() {
         ReadValue<u8>(global, 0x1592) != 0 || GetLocalPlayerType() == 2) {
         warping = false;
         target_map = 0;
+        host_reloads_known = false;
+        rest_reload_since_ms = 0;
         return; // not a co-op guest in someone else's world (an invader does not follow)
     }
     // Test 2026-10-08 (cls_amg, guest): the wipe reload finished and in the same tick the follow
@@ -4920,9 +4951,24 @@ void TickBbscFollowHost() {
         !IsUsablePackedMap(host.packed_map)) {
         return; // the host is not telling us anything we can act on
     }
+    if (!host_reloads_known || host.host_reloads != host_reloads_seen) {
+        if (host_reloads_known && host.host_reloads != 0) {
+            if (now - last_load_ms < BbscRestOwnLoadMs) {
+                LOG_INFO(Debug, "BBSC rest: host reloaded its map (reload {}), we loaded too - "
+                         "nothing to do", host.host_reloads);
+            } else {
+                rest_reload_since_ms = now;
+                LOG_INFO(Debug, "BBSC rest: host reloaded map {:#x} (reload {})",
+                         host.packed_map, host.host_reloads);
+            }
+        }
+        host_reloads_known = true;
+        host_reloads_seen = host.host_reloads;
+    }
 
     if (warping) {
-        if (GetCurrentPackedMap() != target_map) {
+        // A load must have run since the request: a rest reload stays in the map we are in.
+        if (GetCurrentPackedMap() != target_map || last_load_ms < warp_requested_ms) {
             if (now - warp_requested_ms > BbscFollowArriveTimeoutMs) {
                 // Never waiting forever again (code review A3): the load went somewhere else.
                 warping = false;
@@ -4935,7 +4981,8 @@ void TickBbscFollowHost() {
             }
             return; // still on the way
         }
-        if (now - warp_requested_ms < BbscFollowSettleMs) {
+        if (now - warp_requested_ms < BbscFollowSettleMs ||
+            now - last_load_ms < BbscFollowSettleMs) {
             return; // arrived, let the map settle before placing the character
         }
         warping = false;
@@ -4995,7 +5042,41 @@ void TickBbscFollowHost() {
     if (!IsUsablePackedMap(here) || here == host.packed_map) {
         mismatch_since_ms = 0;
         shared_host_map = host.packed_map;
-        return; // same map as the host: nothing to follow
+        if (rest_reload_since_ms == 0 || here != host.packed_map) {
+            return; // same map as the host: nothing to follow
+        }
+        if (now - rest_reload_since_ms > BbscRestReloadWindowMs) {
+            rest_reload_since_ms = 0;
+            LOG_WARNING(Debug, "BBSC rest: no reload after the host's rest within {} s, given up",
+                        BbscRestReloadWindowMs / 1000);
+            return;
+        }
+        if (!settled || GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
+            return; // just out of a load, or dead: the reload waits
+        }
+        rest_reload_since_ms = 0;
+        if (BbscHostWorldFlagsReady(here)) {
+            ApplyBbscHostWorldFlags(here, "before the rest reload");
+        }
+        ApplyBbscHostTime("before the rest reload");
+        ApplyBbscGuestLootView(here, "before the rest reload");
+        const BbscFollowSpot spot = BbscFollowSpotOf(host);
+        SummonPlacementDescriptor to{};
+        to.packed_region = here;
+        to.x = spot.x + 1.0f;
+        to.y = spot.y;
+        to.z = spot.z;
+        to.heading = spot.heading;
+        LOG_INFO(Debug, "BBSC rest: the host rested in our map {:#x} - reloading it too", here);
+        BBSC_TIMELINE("REST", "rest: reloading map {:#x} after the host's rest", here);
+        if (!RequestBbscSessionWarp(global, to, "rest")) {
+            LOG_WARNING(Debug, "BBSC rest: could not ask for the reload of {:#x}", here);
+            return;
+        }
+        warping = true;
+        target_map = here;
+        warp_requested_ms = now;
+        return;
     }
     // Report 2026-09-28: a loading screen every time the host walked into the next area. When the
     // host's map is loaded in our game too and the host did not get there by a load (lamp, death
@@ -12333,6 +12414,9 @@ void TickBbscLockKeys() {
 // Names: no character name offset is known for 1.09 yet, so the label is the role.
 constexpr float BbscMarkerHeadMetres = 1.9f; // above the character's feet
 constexpr float BbscMarkerEdge = 0.04f;      // how close to the frame's edge a marker may go
+// 2026-10-23 test: in view and close, the game's own nameplate (name and HP bar) is already over
+// the player and the marker doubled it. Closer than this and on screen, no marker.
+constexpr float BbscMarkerNearMetres = 15.0f;
 
 bool bbsc_markers_on = true;
 
@@ -12410,6 +12494,17 @@ void TickBbscPlayerMarkers() {
         const float z = dot(d, fwd);
         float sx = dot(d, right) / (std::max(std::abs(z), 0.1f) * tan_half * aspect);
         float sy = dot(d, up) / (std::max(std::abs(z), 0.1f) * tan_half);
+        float metres = -1.0f;
+        if (own.has_value()) {
+            const float dx = at->position[0] - own->position[0];
+            const float dy = at->position[1] - own->position[1];
+            const float dz = at->position[2] - own->position[2];
+            metres = std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        if (z >= 0.1f && std::abs(sx) <= 1.0f && std::abs(sy) <= 1.0f && metres >= 0.0f &&
+            metres < BbscMarkerNearMetres) {
+            continue; // the game's nameplate shows this one
+        }
         if (z < 0.1f) {
             // Behind the camera: to the side it is on, along the bottom edge.
             sx = sx < 0.0f ? -1.0f : 1.0f;
@@ -12425,12 +12520,8 @@ void TickBbscPlayerMarkers() {
         marker.x = 0.5f + 0.5f * sx;
         marker.y = 0.5f - 0.5f * sy;
         const char* role = type == 0 ? "Host" : "Hunter";
-        if (own.has_value()) {
-            const float dx = at->position[0] - own->position[0];
-            const float dy = at->position[1] - own->position[1];
-            const float dz = at->position[2] - own->position[2];
-            std::snprintf(marker.text, sizeof(marker.text), "%s  %.0f m", role,
-                          std::sqrt(dx * dx + dy * dy + dz * dz));
+        if (metres >= 0.0f) {
+            std::snprintf(marker.text, sizeof(marker.text), "%s  %.0f m", role, metres);
         } else {
             std::snprintf(marker.text, sizeof(marker.text), "%s", role);
         }
@@ -17106,7 +17197,8 @@ void OnBbscWorldFlagsPacket(const void* data, std::uint32_t size) {
 }
 
 void OnBbscHostFollowPacket(std::uint32_t packed_map, float x, float y, float z, float heading,
-                            std::uint32_t sequence, std::int32_t lamp_point) {
+                            std::uint32_t sequence, std::int32_t lamp_point,
+                            std::uint8_t host_reloads) {
     if (!BbscWarpTogetherEnabled()) {
         return;
     }
@@ -17138,6 +17230,7 @@ void OnBbscHostFollowPacket(std::uint32_t packed_map, float x, float y, float z,
                          (packed_map == previous.packed_map &&
                           dx * dx + dy * dy + dz * dz > 30.0f * 30.0f);
     bbsc_follow_latest = {packed_map, x, y, z, heading, sequence, lamp_point, now};
+    bbsc_follow_latest.host_reloads = host_reloads;
     if (arrived) {
         bbsc_follow_latest.arrival_ms = now;
         bbsc_follow_latest.arrival_by_load = silence;
