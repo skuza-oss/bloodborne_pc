@@ -10242,6 +10242,7 @@ struct BbscCineState {
 };
 BbscCineState bbsc_cine;
 alignas(16) std::array<u8, 0x200> bbsc_cine_camera_storage{};
+std::atomic<u64> bbsc_camera_director{0}; // the last director the update hook saw
 
 float BbscWrapAngle(float a) {
     constexpr float Pi = 3.14159265f;
@@ -10272,6 +10273,7 @@ void PS4_SYSV_ABI BbscCinematicCameraHook(u64 /*tag*/, const GuestRegisterSnapsh
         return;
     }
     const u64 director = registers->rdi;
+    bbsc_camera_director.store(director, std::memory_order_relaxed); // the player markers' camera
     Bbsc::CinematicInput in = Bbsc::TakeCinematicInput();
     // Dead in co-op: F1 looks around freely while waiting (2026-10-04, the user's pick over a
     // follow-the-partner camera). On respawn the camera goes back to the hunter by itself.
@@ -10812,6 +10814,135 @@ void TickBbscLockKeys() {
     reinterpret_cast<SetHp>(image_base + 0x018BCD40)(player, 0);
     LOG_INFO(Debug, "BBSC lock keys: Ctrl+F9 - local player HP {} -> 0 (now {}), session state {}",
              hp, GetCharacterHp(player), state);
+}
+
+// ---- Player markers (2026-10-23) ----------------------------------------------------------------
+// The user: "see other players names through walls so we know where they are". Every game tick, each
+// co-op player in WorldChrMan (not the local one, not an invader) is projected with the render
+// camera (director +0x10: right, up, forward, position rows at +0x10..+0x4F, vertical field of view
+// +0x50, aspect +0x54 - see "Cinematic camera" and the port's aspect hook) and handed to the
+// overlay, which draws over the finished frame: through walls. Off screen or behind the camera a
+// marker sticks to the nearest edge so it still points the way. F7 in the game window turns them
+// off and on. Screen right is taken as up x forward (Direct3D's left-handed convention, the one the
+// cinematic camera's basis matches); the first projection is logged so a mirrored result shows.
+// Names: no character name offset is known for 1.09 yet, so the label is the role.
+constexpr float BbscMarkerHeadMetres = 1.9f; // above the character's feet
+constexpr float BbscMarkerEdge = 0.04f;      // how close to the frame's edge a marker may go
+
+bool bbsc_markers_on = true;
+
+void TickBbscPlayerMarkers() {
+#ifdef BBSC_MOD
+    return; // the port's overlay draws them; a stock emulator has none
+#endif
+    if (Core::Bbsc::KeyPressed(0x76 /* VK_F7 */) == 1) {
+        bbsc_markers_on = !bbsc_markers_on;
+        LOG_INFO(Debug, "BBSC player markers: F7 - {}", bbsc_markers_on ? "on" : "off");
+    }
+    if (!bbsc_markers_on || image_base == 0) {
+        return;
+    }
+    const u64 global = GetGlobalState();
+    if (ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0) {
+        return; // a load: the markers fade out by themselves
+    }
+    const u64 world_chr = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
+    if (!ReadablePointer(world_chr, 0x68)) {
+        return;
+    }
+    const u64 local = ReadValue<u64>(world_chr, 0x60);
+    const s32 count = ReadValue<s32>(world_chr, 0x30);
+    const u64 entries = ReadValue<u64>(world_chr, 0x38);
+    if (count <= 1 || count > 64 || !ReadablePointer(entries, static_cast<size_t>(count) * 0x38)) {
+        return; // alone
+    }
+    const u64 director = bbsc_camera_director.load(std::memory_order_relaxed);
+    const u64 camera = ReadablePointer(director, 0xD8) ? ReadValue<u64>(director, 0x10) : 0;
+    if (!ReadablePointer(camera, 0x60)) {
+        return;
+    }
+    std::array<float, 16> m{};
+    std::memcpy(m.data(), reinterpret_cast<const void*>(camera + 0x10), sizeof(m));
+    const std::array<float, 3> up{m[4], m[5], m[6]};
+    const std::array<float, 3> fwd{m[8], m[9], m[10]};
+    const std::array<float, 3> eye{m[12], m[13], m[14]};
+    const auto dot = [](const std::array<float, 3>& a, const std::array<float, 3>& b) {
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    };
+    // Not a camera matrix (a stale director after a load): no markers this tick.
+    if (std::abs(dot(up, up) - 1.0f) > 0.05f || std::abs(dot(fwd, fwd) - 1.0f) > 0.05f ||
+        std::abs(dot(up, fwd)) > 0.05f || !std::isfinite(eye[0] + eye[1] + eye[2])) {
+        return;
+    }
+    const std::array<float, 3> right{up[1] * fwd[2] - up[2] * fwd[1], up[2] * fwd[0] - up[0] * fwd[2],
+                                     up[0] * fwd[1] - up[1] * fwd[0]};
+    const float fov = ReadValue<float>(camera, 0x50);
+    float aspect = ReadValue<float>(camera, 0x54);
+    if (!(fov > 0.05f && fov < 3.0f)) {
+        return;
+    }
+    if (!(aspect > 0.3f && aspect < 5.0f)) {
+        aspect = 16.0f / 9.0f;
+    }
+    const float tan_half = std::tan(fov * 0.5f);
+    const auto own = ReadCharacterTransform(local);
+
+    std::array<Core::Bbsc::PlayerMarker, 8> markers{};
+    int shown = 0;
+    for (s32 i = 0; i < count && shown < static_cast<int>(markers.size()); ++i) {
+        const u64 player = ReadValue<u64>(entries, static_cast<size_t>(i) * 0x38);
+        const s32 type = player != 0 && player != local ? GetCharacterType(player) : -1;
+        if (type < 0 || IsInvaderType(type) || GetCharacterHp(player) <= 0) {
+            continue;
+        }
+        const auto at = ReadCharacterTransform(player);
+        if (!at.has_value()) {
+            continue;
+        }
+        const std::array<float, 3> d{at->position[0] - eye[0],
+                                     at->position[1] + BbscMarkerHeadMetres - eye[1],
+                                     at->position[2] - eye[2]};
+        const float z = dot(d, fwd);
+        float sx = dot(d, right) / (std::max(std::abs(z), 0.1f) * tan_half * aspect);
+        float sy = dot(d, up) / (std::max(std::abs(z), 0.1f) * tan_half);
+        if (z < 0.1f) {
+            // Behind the camera: to the side it is on, along the bottom edge.
+            sx = sx < 0.0f ? -1.0f : 1.0f;
+            sy = -1.0f;
+        }
+        // Off the frame: pulled in along the line from the centre, so it points the way.
+        const float reach = std::max(std::abs(sx), std::abs(sy));
+        if (reach > 1.0f - BbscMarkerEdge) {
+            sx *= (1.0f - BbscMarkerEdge) / reach;
+            sy *= (1.0f - BbscMarkerEdge) / reach;
+        }
+        auto& marker = markers[shown++];
+        marker.x = 0.5f + 0.5f * sx;
+        marker.y = 0.5f - 0.5f * sy;
+        const char* role = type == 0 ? "Host" : "Hunter";
+        if (own.has_value()) {
+            const float dx = at->position[0] - own->position[0];
+            const float dy = at->position[1] - own->position[1];
+            const float dz = at->position[2] - own->position[2];
+            std::snprintf(marker.text, sizeof(marker.text), "%s  %.0f m", role,
+                          std::sqrt(dx * dx + dy * dy + dz * dz));
+        } else {
+            std::snprintf(marker.text, sizeof(marker.text), "%s", role);
+        }
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_INFO(Debug,
+                     "BBSC player markers: first one at ({:.2f}, {:.2f}) of the frame, {:.1f} m "
+                     "ahead; camera fov {:.3f} aspect {:.3f}, right ({:.2f}, {:.2f}, {:.2f}) vs "
+                     "the game's row ({:.2f}, {:.2f}, {:.2f})",
+                     marker.x, marker.y, z, fov, aspect, right[0], right[1], right[2], m[0], m[1],
+                     m[2]);
+        }
+    }
+    if (shown > 0) {
+        Core::Bbsc::ShowPlayerMarkers(markers.data(), shown);
+    }
 }
 
 // 2026-10-01 test: the guest saw items it could not pick up. The prompt search 0x017D9FB0 takes
@@ -13716,6 +13847,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscGuestItemsPickable();
         TickBbscUnstuckKey();
         TickBbscLockKeys();
+        TickBbscPlayerMarkers();
         TickBbscLifeBroadcast();
         TickBbscSessionEnd();
         TickBbscStrayForcedWarp();

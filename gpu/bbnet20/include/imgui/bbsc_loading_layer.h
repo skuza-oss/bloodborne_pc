@@ -13,4 +13,12 @@ enum class LoadingScreenKind { Summon, Follow };
 void ShowLoadingScreen(LoadingScreenKind kind);
 void HideLoadingScreen();
 
+// Where the other players are: a label at x, y (0 to 1 across the shown frame) per player, drawn
+// over everything (walls too). Each call replaces the set; not renewing it lets them fade out.
+struct PlayerMarker {
+    float x = 0.0f, y = 0.0f;
+    char text[64] = {};
+};
+void ShowPlayerMarkers(const PlayerMarker* markers, int count);
+
 } // namespace Core::Bbsc

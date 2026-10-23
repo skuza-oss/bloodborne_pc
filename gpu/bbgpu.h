@@ -62,6 +62,14 @@ void bbgpu_filter_pad(uint32_t *buttons, const uint8_t *sticks);
 float bbgpu_frame_aspect(void);
 /* A line of text over the game, near the bottom, until called with NULL (any thread). */
 void bbgpu_overlay_banner(const char *utf8);
+/* Labels over the game image (BBSC: where the other players are): x, y from 0 to 1 across the shown
+ * frame, text UTF-8. Each call replaces the set; they vanish when not renewed for half a second
+ * (any thread). */
+typedef struct BbGpuMarker {
+    float x, y;
+    char text[64];
+} BbGpuMarker;
+void bbgpu_overlay_markers(const BbGpuMarker *markers, int count);
 /* Native mouse look: turns the game's camera (radians, applied at its next update); 0 when the
  * camera hook is not in (another game version, BB_NATIVE_MOUSE=0) or the camera does not take the
  * turns now (lock-on, menus): drive the right stick then. */

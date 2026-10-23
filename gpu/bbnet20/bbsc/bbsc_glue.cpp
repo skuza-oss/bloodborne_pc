@@ -22,6 +22,17 @@ void HideLoadingScreen() {
     bbgpu_overlay_banner(nullptr);
 }
 
+void ShowPlayerMarkers(const PlayerMarker* markers, int count) {
+    BbGpuMarker out[8];
+    const int n = count < 0 ? 0 : count > 8 ? 8 : count;
+    for (int i = 0; i < n; ++i) {
+        out[i].x = markers[i].x;
+        out[i].y = markers[i].y;
+        std::snprintf(out[i].text, sizeof(out[i].text), "%s", markers[i].text);
+    }
+    bbgpu_overlay_markers(out, n);
+}
+
 void StartIntro(std::string_view) {}
 
 } // namespace Core::Bbsc

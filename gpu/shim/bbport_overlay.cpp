@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
+#include "../bbgpu.h"
 #include "bbport_guest_hooks.h"
 #include "bbport_frame_rate.h"
 #include "bbport_settings.h"
@@ -69,6 +70,12 @@ std::atomic<bool> prompt_active{false};
 std::mutex banner_mutex;
 std::string banner_text;
 std::atomic<bool> banner_active{false};
+/// A module's labels over the game image (bbgpu_overlay_markers: BBSC's other players), dropped
+/// when not renewed for MarkerFreshMs (a load, a pause, the module stopped sending).
+constexpr std::int64_t MarkerFreshMs = 500;
+std::mutex marker_mutex;
+std::vector<BbGpuMarker> markers;
+std::atomic<std::int64_t> markers_ms{0};
 std::string prompt_title, prompt_text;
 
 // Present rate for the FPS counter.
@@ -1155,8 +1162,53 @@ void SetBanner(const char* text) {
     banner_active = text != nullptr && text[0] != 0;
 }
 
+std::int64_t SteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void SetMarkers(const BbGpuMarker* list, int count) {
+    {
+        std::scoped_lock lock{marker_mutex};
+        markers.assign(list, list + std::max(count, 0));
+    }
+    markers_ms = count > 0 ? SteadyMs() : 0;
+}
+
+bool MarkersFresh() {
+    const std::int64_t at = markers_ms.load(std::memory_order_relaxed);
+    return at != 0 && SteadyMs() - at < MarkerFreshMs;
+}
+
+/// The markers over the shown frame (fitted and centred in the window, as the present blit puts
+/// it): a dot and the text above it, with a shadow so it reads on bright and dark ground.
+void DrawMarkers(const ImVec2& display) {
+    std::vector<BbGpuMarker> list;
+    {
+        std::scoped_lock lock{marker_mutex};
+        list = markers;
+    }
+    const float aspect = std::max(bbgpu_frame_aspect(), 0.1f);
+    const float frame_h = std::min(display.y, display.x / aspect);
+    const float frame_w = frame_h * aspect;
+    const ImVec2 origin{(display.x - frame_w) * 0.5f, (display.y - frame_h) * 0.5f};
+    auto* draw = ImGui::GetForegroundDrawList();
+    const float dot = std::max(frame_h / 1080.0f, 0.75f) * 4.0f;
+    for (BbGpuMarker& m : list) {
+        m.text[sizeof(m.text) - 1] = 0;
+        const ImVec2 at{origin.x + m.x * frame_w, origin.y + m.y * frame_h};
+        const ImVec2 size = ImGui::CalcTextSize(m.text);
+        const ImVec2 text_at{at.x - size.x * 0.5f, at.y - dot * 2.0f - size.y};
+        draw->AddCircleFilled(at, dot + 1.5f, IM_COL32(0, 0, 0, 200));
+        draw->AddCircleFilled(at, dot, IM_COL32(235, 200, 120, 255));
+        draw->AddText({text_at.x + 1.5f, text_at.y + 1.5f}, IM_COL32(0, 0, 0, 220), m.text);
+        draw->AddText(text_at, IM_COL32(240, 230, 210, 255), m.text);
+    }
+}
+
 bool Visible() {
-    return initialized && (menu_open || prompt_active || banner_active ||
+    return initialized && (menu_open || prompt_active || banner_active || MarkersFresh() ||
                            BbSettings::Get().show_fps);
 }
 
@@ -1226,6 +1278,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (prompt_active && !menu_open) {
         TextPrompt();
     }
+    if (MarkersFresh() && !menu_open) {
+        DrawMarkers(io.DisplaySize);
+    }
     if (banner_active) {
         std::string text;
         {
@@ -1265,4 +1320,8 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
 
 extern "C" void bbgpu_overlay_banner(const char* text) {
     BbOverlay::SetBanner(text);
+}
+
+extern "C" void bbgpu_overlay_markers(const BbGpuMarker* markers, int count) {
+    BbOverlay::SetMarkers(markers, count);
 }
