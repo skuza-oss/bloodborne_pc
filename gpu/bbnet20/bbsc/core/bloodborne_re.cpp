@@ -4914,6 +4914,7 @@ void TickBbscFollowHost() {
     static bool host_reloads_known = false;
     static u8 host_reloads_seen = 0;
     static s64 rest_reload_since_ms = 0; // the host rested in our map: reload it too (0: no)
+    static bool rest_warping = false;    // the warp in flight is a rest reload, not a follow
     if (!BbscWarpTogetherEnabled() || image_base == 0) {
         return;
     }
@@ -4927,6 +4928,7 @@ void TickBbscFollowHost() {
     if (GetSessionState() != 6 || !ReadablePointer(global, 0x1598) ||
         ReadValue<u8>(global, 0x1592) != 0 || GetLocalPlayerType() == 2) {
         warping = false;
+        rest_warping = false;
         target_map = 0;
         host_reloads_known = false;
         rest_reload_since_ms = 0;
@@ -4938,6 +4940,7 @@ void TickBbscFollowHost() {
     static s64 last_load_ms = 0;
     if (ReadValue<u8>(global, 0x08) != 0) {
         last_load_ms = now;
+        rest_reload_since_ms = 0; // our map is reloading anyway
         return; // a load is running: let it finish, whoever asked for it
     }
     const bool settled = now - last_load_ms >= BbscFollowAfterLoadMs;
@@ -4953,9 +4956,11 @@ void TickBbscFollowHost() {
     }
     if (!host_reloads_known || host.host_reloads != host_reloads_seen) {
         if (host_reloads_known && host.host_reloads != 0) {
-            if (now - last_load_ms < BbscRestOwnLoadMs) {
-                LOG_INFO(Debug, "BBSC rest: host reloaded its map (reload {}), we loaded too - "
-                         "nothing to do", host.host_reloads);
+            if (now - last_load_ms < BbscRestOwnLoadMs ||
+                GetCurrentPackedMap() != host.packed_map) {
+                LOG_INFO(Debug, "BBSC rest: host reloaded map {:#x} (reload {}); we are in {:#x}"
+                         " or loaded lately - nothing to do", host.packed_map, host.host_reloads,
+                         GetCurrentPackedMap());
             } else {
                 rest_reload_since_ms = now;
                 LOG_INFO(Debug, "BBSC rest: host reloaded map {:#x} (reload {})",
@@ -4967,11 +4972,13 @@ void TickBbscFollowHost() {
     }
 
     if (warping) {
-        // A load must have run since the request: a rest reload stays in the map we are in.
-        if (GetCurrentPackedMap() != target_map || last_load_ms < warp_requested_ms) {
+        // A rest reload stays in the map we are in: its load must have run since the request.
+        if (GetCurrentPackedMap() != target_map ||
+            (rest_warping && last_load_ms < warp_requested_ms)) {
             if (now - warp_requested_ms > BbscFollowArriveTimeoutMs) {
                 // Never waiting forever again (code review A3): the load went somewhere else.
                 warping = false;
+                rest_warping = false;
                 LOG_WARNING(Debug,
                             "BBSC warp together: no arrival in map {:#x} after {} s (now in "
                             "{:#x}), attempt {} of {}",
@@ -4982,10 +4989,11 @@ void TickBbscFollowHost() {
             return; // still on the way
         }
         if (now - warp_requested_ms < BbscFollowSettleMs ||
-            now - last_load_ms < BbscFollowSettleMs) {
+            (rest_warping && now - last_load_ms < BbscFollowSettleMs)) {
             return; // arrived, let the map settle before placing the character
         }
         warping = false;
+        rest_warping = false;
         const u64 player = GetLocalPlayerCharacter();
         const u64 vtable = ReadablePointer(player, 0x08) ? ReadValue<u64>(player, 0) : 0;
         const u64 warp = ReadablePointer(vtable, 0x600) ? ReadValue<u64>(vtable, 0x5F8) : 0;
@@ -5074,6 +5082,7 @@ void TickBbscFollowHost() {
             return;
         }
         warping = true;
+        rest_warping = true;
         target_map = here;
         warp_requested_ms = now;
         return;
@@ -5192,6 +5201,7 @@ void TickBbscFollowHost() {
         return;
     }
     warping = true;
+    rest_warping = false;
     target_map = host.packed_map;
     warp_requested_ms = now;
     ArmBbscRejoinLines(true, host.packed_map, BbscFollowArriveTimeoutMs);
