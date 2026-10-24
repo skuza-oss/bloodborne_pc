@@ -13757,19 +13757,11 @@ void TickBbscDeadWatchdog() {
                     limit, session_state, bbsc_spectate_active);
     }
     bbsc_spectate_active = false;
-    // 2026-10-24 (user, host): "im still floating above ground sometimes", at 60 FPS on both. In the
-    // host's timeline every float came after repeat deaths in one load revived on the spot by this
-    // watchdog (00:26:05, 00:27:02, 00:27:18, then F8 at 00:33 lifted the player 0.5 m each press and
-    // it stayed up: no gravity, the nearest other character 26 m away); a real reload (the Hunter's
-    // Dream) ended it. Those deaths never ran the game's death step (SoloPlayDeath), which the first
-    // death of a load does. So a repeat death now ends with the game's own death reload, the way the
-    // one right after a respawn in place already did; the first death of a load still respawns in
-    // place. BB_REPEAT_DEATH_IN_PLACE=1: the old revive on the spot.
-    static const bool in_place = [] {
-        const char* env = std::getenv("BB_REPEAT_DEATH_IN_PLACE");
-        return env && env[0] == '1';
-    }();
-    if ((repeat && !in_place) || BbscDiedRightAfterRespawn("watchdog")) {
+    // 2026-10-24: 0.7.6 ended every repeat death here with the game's death reload (the host's floats
+    // came after such revives on the spot). With a guest in the world that reload sent the host to
+    // the title screen and the guest home (user: "when host dies both players get kicked out"), so a
+    // repeat death revives on the spot again; only the rare death right after a respawn reloads.
+    if (BbscDiedRightAfterRespawn("watchdog")) {
         if (session_state == 6 && LivingPartnerExists()) {
             // Guest: hand over to TickBbscSpectate's wipe path (full reload beside the host).
             bbsc_spectate_name = "repeat death";
@@ -13787,8 +13779,7 @@ void TickBbscDeadWatchdog() {
             return;
         }
         BbscApplyDeathPenalty("watchdog");
-        RequestBbscDeathReload(repeat ? "watchdog: repeat death in the same load"
-                                      : "watchdog: repeat death right after a respawn in place");
+        RequestBbscDeathReload("watchdog: repeat death right after a respawn in place");
         return;
     }
     BbscApplyDeathPenalty("watchdog");
